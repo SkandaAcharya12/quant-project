@@ -1,0 +1,35 @@
+"""Module 4: risk engine (VaR / ES, drawdown, backtests, stress tests)."""
+from risk_engine.risk_engine import (
+    DEFAULT_HISTORICAL_SCENARIOS,
+    DEFAULT_MACRO_SCENARIOS,
+    DrawdownAnalysis,
+    FactorModel,
+    FactorScenario,
+    RiskConfig,
+    RiskEngine,
+    RiskError,
+    RiskReport,
+    christoffersen_independence,
+    cornish_fisher_quantile,
+    drawdown_analysis,
+    es_historical,
+    es_parametric,
+    ewma_variance,
+    fhs_var_es,
+    fit_factor_model,
+    kupiec_pof,
+    macro_factor_frame,
+    risk_contributions,
+    var_cornish_fisher,
+    var_historical,
+    var_parametric,
+)
+
+__all__ = [
+    "DEFAULT_HISTORICAL_SCENARIOS", "DEFAULT_MACRO_SCENARIOS", "DrawdownAnalysis",
+    "FactorModel", "FactorScenario", "RiskConfig", "RiskEngine", "RiskError", "RiskReport",
+    "christoffersen_independence", "cornish_fisher_quantile", "drawdown_analysis",
+    "es_historical", "es_parametric", "ewma_variance", "fhs_var_es", "fit_factor_model",
+    "kupiec_pof", "macro_factor_frame", "risk_contributions", "var_cornish_fisher",
+    "var_historical", "var_parametric",
+]
