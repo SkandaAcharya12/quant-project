@@ -21,6 +21,7 @@ from typing_extensions import Self
 
 import data_engine.data_engine as de
 from market_engine import TickerOption
+from paper_trading import ResearchAgent
 from tests.test_optimizer import make_returns, to_prices
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +165,11 @@ class _Trace:
 class FakeFigure:
     def __init__(self, *_a: object, **_k: object) -> None:
         self.ops: list[str] = []
+        self.traces: list[_Trace] = []
+
+    def add_trace(self, trace: _Trace, *_a: object, **_k: object) -> None:
+        self.ops.append("add_trace")
+        self.traces.append(trace)
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         if name.startswith("__"):
@@ -243,6 +249,51 @@ class ComputationLayerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.app.compute_risk(self.prices, w, macro, 500_000.0, 1, (0.95, 0.99), "2026-06-01")
 
+    def test_paper_signal_chart_uses_real_candles_and_causal_agent_features(self) -> None:
+        fake_streamlit = FakeStreamlit()
+        with mock.patch.dict(sys.modules, fake_modules(fake_streamlit)):
+            app_module = import_app(fake_streamlit)
+        close = self.prices["A"].iloc[:600]
+        open_prices = close.shift(1).fillna(close.iloc[0])
+        ohlcv = pd.DataFrame(
+            {
+                "Open": open_prices,
+                "High": pd.concat([open_prices, close], axis=1).max(axis=1) * 1.01,
+                "Low": pd.concat([open_prices, close], axis=1).min(axis=1) * 0.99,
+                "Close": close,
+                "Volume": 1_000_000.0,
+            },
+            index=close.index,
+        )
+        cutoff = close.index[-2]
+        alert = ResearchAgent().evaluate(close, "A", as_of=cutoff)
+        figure = app_module.paper_signal_figure(
+            ohlcv, "A", cutoff, alert, (), currency_code="USD", currency_symbol="$"
+        )
+
+        self.assertIsNotNone(figure)
+        candles = [trace for trace in figure.traces if "open" in trace.kw]
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(list(candles[0].kw["close"]), list(ohlcv["Close"].tail(180)))
+        feature_traces = [
+            trace for trace in figure.traces
+            if trace.kw.get("name") in {
+                "5-session momentum",
+                "21-session momentum",
+                "63-session momentum",
+                "20/60-session moving-average spread",
+                "21-session realized volatility",
+            }
+        ]
+        self.assertEqual(len(feature_traces), 5)
+        for trace in feature_traces:
+            self.assertLessEqual(max(pd.DatetimeIndex(trace.kw["x"])), cutoff)
+        feature_readout = app_module.paper_feature_readout(close, cutoff, alert)
+        expected = dict(alert.evidence)
+        for key, label, _ in app_module._PAPER_FEATURES:
+            row = feature_readout.loc[feature_readout["feature"] == label].iloc[0]
+            self.assertAlmostEqual(float(row["reading"]), expected[key])
+
 
 class UiWiringTests(unittest.TestCase):
     def _run(self, overrides: dict[str, object] | None = None) -> FakeStreamlit:
@@ -292,9 +343,27 @@ class UiWiringTests(unittest.TestCase):
             },
             index=prices.index,
         )
+
+        def raw_history(symbol: str, _start: str) -> pd.DataFrame:
+            close = selected[symbol]
+            open_prices = close.shift(1).fillna(close.iloc[0])
+            return pd.DataFrame(
+                {
+                    "Open": open_prices,
+                    "High": pd.concat([open_prices, close], axis=1).max(axis=1) * 1.01,
+                    "Low": pd.concat([open_prices, close], axis=1).min(axis=1) * 0.99,
+                    "Close": close,
+                    "Volume": 1_000_000.0,
+                },
+                index=close.index,
+            )
+
         with mock.patch.dict(sys.modules, fake_modules(st)):
             app = import_app(st)
-            with mock.patch.object(app, "load_prices", return_value=selected):
+            with (
+                mock.patch.object(app, "load_prices", return_value=selected),
+                mock.patch.object(app, "load_ohlcv_history", side_effect=raw_history),
+            ):
                 app.render_paper_trading(
                     prices, "2024-01-02", ticker_catalog=ticker_catalog
                 )
@@ -303,13 +372,14 @@ class UiWiringTests(unittest.TestCase):
         self.assertEqual(account.fills[0].action.value, "BUY")
         self.assertEqual(account.fills[0].symbol, "AAPL")
         self.assertEqual(st.session_state["paper_default_tradable_tickers"], ["AAPL", "MSFT"])
-        self.assertGreaterEqual(st.calls.count("plotly_chart"), 1)
+        self.assertGreaterEqual(st.calls.count("plotly_chart"), 2)
 
         st.overrides.update({"Place paper order": False, "Add stocks to account": True,
                              "Stocks to add": ["NVDA"]})
         with (
             mock.patch.dict(sys.modules, fake_modules(st)),
             mock.patch.object(app, "load_prices", return_value=selected) as fetch_prices,
+            mock.patch.object(app, "load_ohlcv_history", side_effect=raw_history),
         ):
             app.render_paper_trading(
                 prices, "2024-01-02", ticker_catalog=ticker_catalog
@@ -325,10 +395,23 @@ class UiWiringTests(unittest.TestCase):
             {"TEST": np.linspace(100.0, 150.0, 260)},
             index=pd.bdate_range("2024-01-02", periods=260),
         )
+        close = prices["TEST"]
+        open_prices = close.shift(1).fillna(close.iloc[0])
+        ohlcv = pd.DataFrame(
+            {
+                "Open": open_prices,
+                "High": pd.concat([open_prices, close], axis=1).max(axis=1) * 1.01,
+                "Low": pd.concat([open_prices, close], axis=1).min(axis=1) * 0.99,
+                "Close": close,
+                "Volume": 1_000_000.0,
+            },
+            index=prices.index,
+        )
         with mock.patch.dict(sys.modules, fake_modules(st)):
             app = import_app(st)
-            app.render_paper_trading(prices, "2024-01-02", "us", "USD", "$")
-            app.render_paper_trading(prices, "2024-01-02", "japan", "JPY", "¥")
+            with mock.patch.object(app, "load_ohlcv_history", return_value=ohlcv):
+                app.render_paper_trading(prices, "2024-01-02", "us", "USD", "$")
+                app.render_paper_trading(prices, "2024-01-02", "japan", "JPY", "¥")
         self.assertIn("paper_us_simulator", st.session_state)
         self.assertIn("paper_japan_simulator", st.session_state)
         self.assertIsNot(
