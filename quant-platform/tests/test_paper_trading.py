@@ -78,6 +78,26 @@ class ResearchAgentTests(unittest.TestCase):
             self.assertNotEqual(early.action, AlertAction.HOLD)
         self.assertEqual(agent.confidence_threshold, 0.90)
 
+    def test_feature_frame_is_public_and_causal(self) -> None:
+        prices = self.prices()
+        cutoff = prices.index[-2]
+        features = ResearchAgent.feature_frame(prices)
+        changed_future = prices.copy()
+        changed_future.iloc[-1] *= 2.0
+        changed_features = ResearchAgent.feature_frame(changed_future)
+
+        self.assertEqual(
+            tuple(features.columns),
+            (
+                "momentum_5",
+                "momentum_21",
+                "momentum_63",
+                "volatility_21",
+                "ma_spread_20_60",
+            ),
+        )
+        pd.testing.assert_series_equal(features.loc[cutoff], changed_features.loc[cutoff])
+
     def test_insufficient_or_malformed_data_fails_clearly(self) -> None:
         agent = ResearchAgent(min_training_observations=100)
         with self.assertRaises(AgentError):
