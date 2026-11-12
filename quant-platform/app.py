@@ -3,11 +3,12 @@ app.py -- Interactive dashboard for the Algorithmic Trading & Portfolio Optimiza
 
 Run with:   streamlit run app.py
 
-Four tabs sit on top of the four engines:
+Five tabs sit on top of the research engines and paper simulator:
     Market data       DataEngine: prices, macro regime indicators
     Pairs trading     PairsBacktester: pair screen, signals, equity curve, trade log
     Portfolio         PortfolioOptimizer: efficient frontier, weights, walk-forward test
     Risk & stress     RiskEngine: VaR / ES, drawdowns, VaR backtests, stress scenarios
+    Paper trading     PaperSimulator: user-confirmed practice orders and machine-learning alerts
 
 Everything is estimated or selected on a FORMATION period (default: through 2024) and judged on a
 later OUT-OF-SAMPLE period (default: 2025 onward). All heavy computation lives in plain functions
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover
 from backtester import BacktestResult, PairsBacktestConfig, PairsBacktester, screen_pairs
 from data_engine import DataEngine, DataEngineConfig
 from optimizer import OptimizationResult, OptimizerConfig, PortfolioOptimizer, WalkForwardResult
+from paper_trading import AgentError, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
     RiskConfig,
     RiskEngine,
@@ -407,6 +409,95 @@ def render_risk(
         st.dataframe(report.factor_stress[["portfolio_return", "pnl_usd"]].round(4))
 
 
+def render_paper_trading(prices: pd.DataFrame) -> None:
+    """Render a user-confirmed paper ledger and an advisory ML alert."""
+    st.subheader("Paper trading simulator")
+    st.caption("Orders are simulated at the latest available close with configurable slippage and fees. "
+               "The research agent only creates alerts; it never places orders.")
+    if prices.empty or prices.dropna(how="all").empty:
+        st.warning("Price history is unavailable for the simulator.")
+        return
+
+    state_key = "paper_trading_simulator"
+    if state_key not in st.session_state:
+        initial_cash = st.number_input("Starting paper cash ($)", 1_000.0, 10_000_000.0,
+                                       100_000.0, 5_000.0, key="paper_initial_cash")
+        if not st.button("Start paper account"):
+            st.info("Start an account to practice with the currently loaded market data.")
+            return
+        st.session_state[state_key] = PaperSimulator(
+            starting_cash=float(initial_cash), commission_bps=1.0, slippage_bps=2.0
+        )
+    simulator = st.session_state[state_key]
+    history = prices.dropna(how="all").sort_index()
+    latest = history.dropna(how="all").iloc[-1].dropna()
+    simulator.mark({str(k): float(v) for k, v in latest.items()})
+    account = simulator.snapshot()
+
+    ticker = st.selectbox("Instrument", list(latest.index), key="paper_ticker")
+    ticker_history = history[ticker].dropna()
+    if len(ticker_history) < 2:
+        st.warning("At least two closes are required to create an alert and simulate a later fill.")
+        return
+    signal_time = ticker_history.index[-2]
+    fill_time = ticker_history.index[-1]
+    fill_price = float(ticker_history.iloc[-1])
+    current_position = next((p for p in account.positions if p.symbol == ticker), None)
+    quantity_held = 0.0 if current_position is None else current_position.quantity
+    try:
+        alert = ResearchAgent().evaluate(
+            ticker_history, ticker, as_of=signal_time, current_quantity=quantity_held
+        )
+        st.info(f"**Research agent: {alert.action.value}** · signal through {alert.as_of.date()} · "
+                f"confidence {alert.confidence:.1%}\n\n{alert.explanation}")
+        st.caption(f"Model trained on {alert.training_observations:,} historical feature rows. "
+                   f"The simulated fill uses the next available close ({fill_time.date()}) to avoid "
+                   "same-bar look-ahead. Predictions are uncertain and are not personalized advice.")
+    except AgentError as exc:
+        st.warning(f"No alert available: {exc}")
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Equity", f"${account.equity:,.2f}")
+    metric_cols[1].metric("Cash", f"${account.cash:,.2f}")
+    metric_cols[2].metric("Positions", str(len(account.positions)))
+    metric_cols[3].metric("Latest close", f"${fill_price:,.2f}",
+                          help=f"Market data timestamp: {fill_time}")
+
+    with st.form("paper_order_form"):
+        action_name = st.selectbox("Paper order action", [a.value for a in TradeAction])
+        quantity = st.number_input("Quantity (shares)", min_value=0.001, value=1.0, step=1.0)
+        submitted = st.form_submit_button("Place paper order")
+    if submitted:
+        try:
+            fill = simulator.submit_order(
+                ticker, TradeAction(action_name), float(quantity), fill_price,
+                timestamp=fill_time.to_pydatetime(),
+            )
+            st.success(f"Simulated {fill.action.value} {fill.quantity:g} {fill.symbol} at "
+                       f"${fill.fill_price:,.2f}; commission ${fill.commission:,.2f}.")
+            account = simulator.snapshot()
+        except OrderError as exc:
+            st.error(str(exc))
+
+    if account.positions:
+        st.markdown("**Open paper positions**")
+        st.dataframe(pd.DataFrame([{
+            "Symbol": p.symbol, "Shares": p.quantity, "Average entry": p.average_entry_price,
+            "Latest mark": p.market_price, "Market value": p.market_value,
+            "Unrealized P&L": p.unrealized_pnl, "Realized P&L": p.realized_pnl,
+        } for p in account.positions]).set_index("Symbol"))
+    if account.fills:
+        st.markdown("**Order audit log**")
+        st.dataframe(pd.DataFrame([{
+            "Time": f.timestamp, "Symbol": f.symbol, "Action": f.action.value,
+            "Shares": f.quantity, "Reference close": f.reference_price,
+            "Fill price": f.fill_price, "Commission": f.commission,
+        } for f in account.fills]).set_index("Time").sort_index(ascending=False))
+    if st.button("Reset paper account", key="reset_paper_account"):
+        del st.session_state[state_key]
+        st.rerun()
+
+
 def main() -> None:
     if st is None:  # pragma: no cover
         raise RuntimeError("streamlit is not installed: pip install -r requirements.txt")
@@ -447,7 +538,8 @@ def main() -> None:
         st.warning(f"Macro data unavailable ({exc}). Factor stress tests will be skipped.")
         macro = None
 
-    tabs = st.tabs(["Market data", "Pairs trading", "Portfolio optimizer", "Risk & stress"])
+    tabs = st.tabs(["Market data", "Pairs trading", "Portfolio optimizer", "Risk & stress",
+                    "Paper trading"])
     with tabs[0]:
         render_overview(prices, macro, oos_s)
     with tabs[1]:
@@ -473,7 +565,13 @@ def main() -> None:
                             int(horizon), confidences, oos_s, start_s)
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Risk analysis failed: {exc}")
+    with tabs[4]:
+        try:
+            render_paper_trading(prices)
+        except Exception as exc:  # noqa: BLE001 - isolate optional research UI failures
+            st.error(f"Paper trading research tool failed: {exc}")
 
 
 if __name__ == "__main__":
     main()
+

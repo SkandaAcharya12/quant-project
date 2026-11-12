@@ -17,6 +17,7 @@ from unittest import mock
 
 import numpy as np
 import pandas as pd
+from typing_extensions import Self
 
 import data_engine.data_engine as de
 from tests.test_optimizer import make_returns, to_prices
@@ -45,7 +46,7 @@ class FakeYahoo:
 
 
 class _Ctx:
-    def __enter__(self) -> "_Ctx":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> bool:
@@ -61,6 +62,8 @@ class FakeStreamlit(types.ModuleType):
         self.calls: list[str] = []
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        self.session_state: dict[str, object] = {}
+        self.tab_labels: list[str] = []
         self.sidebar = _Widgets(self)
 
     # decorators / containers
@@ -71,9 +74,13 @@ class FakeStreamlit(types.ModuleType):
         return [_Widgets(self) for _ in range(spec if isinstance(spec, int) else len(spec))]
 
     def tabs(self, labels):  # type: ignore[no-untyped-def]
+        self.tab_labels = list(labels)
         return [_Widgets(self) for _ in labels]
 
     def expander(self, *_a: object, **_k: object) -> _Ctx:
+        return _Ctx()
+
+    def form(self, *_a: object, **_k: object) -> _Ctx:
         return _Ctx()
 
     def spinner(self, *_a: object, **_k: object) -> _Ctx:
@@ -118,6 +125,12 @@ class FakeStreamlit(types.ModuleType):
 
     def checkbox(self, label, value=False, **_k):  # type: ignore[no-untyped-def]
         return self._value(label, value)
+
+    def button(self, label, **_k):  # type: ignore[no-untyped-def]
+        return self._value(label, False)
+
+    def form_submit_button(self, label, **_k):  # type: ignore[no-untyped-def]
+        return self._value(label, False)
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         if name.startswith("__"):
@@ -226,6 +239,20 @@ class UiWiringTests(unittest.TestCase):
         self.assertEqual(st.calls.count("plotly_chart"), 11)
         self.assertEqual(st.calls.count("dataframe"), 10)
         self.assertIn("title", st.calls)
+        self.assertIn("Paper trading", st.tab_labels)
+
+    def test_paper_order_requires_and_records_explicit_user_submission(self) -> None:
+        st = FakeStreamlit({"Start paper account": True, "Place paper order": True})
+        prices = pd.DataFrame(
+            {"TEST": 100 * np.exp(np.cumsum(np.random.default_rng(9).normal(0.0002, 0.01, 260)))},
+            index=pd.bdate_range("2024-01-02", periods=260),
+        )
+        with mock.patch.dict(sys.modules, fake_modules(st)):
+            app = import_app(st)
+            app.render_paper_trading(prices)
+        account = st.session_state["paper_trading_simulator"].snapshot()
+        self.assertEqual(len(account.fills), 1)
+        self.assertEqual(account.fills[0].action.value, "BUY")
 
     def test_invalid_dates_stop_with_message(self) -> None:
         with self.assertRaises(RuntimeError):
@@ -244,3 +271,4 @@ class UiWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
