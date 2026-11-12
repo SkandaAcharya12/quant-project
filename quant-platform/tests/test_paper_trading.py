@@ -72,6 +72,11 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertAlmostEqual(early.probability_up + early.probability_down, 1.0)
         self.assertIn(early.action, tuple(AlertAction))
         self.assertNotEqual(early.as_of, extended.as_of)
+        if early.confidence < 0.90:
+            self.assertEqual(early.action, AlertAction.HOLD)
+        else:
+            self.assertNotEqual(early.action, AlertAction.HOLD)
+        self.assertEqual(agent.confidence_threshold, 0.90)
 
     def test_insufficient_or_malformed_data_fails_clearly(self) -> None:
         agent = ResearchAgent(min_training_observations=100)

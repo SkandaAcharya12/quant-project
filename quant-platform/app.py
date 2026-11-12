@@ -556,13 +556,16 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
     current_position = next((p for p in account.positions if p.symbol == ticker), None)
     quantity_held = 0.0 if current_position is None else current_position.quantity
     try:
-        alert = ResearchAgent().evaluate(
+        research_agent = ResearchAgent()
+        alert = research_agent.evaluate(
             ticker_history, ticker, as_of=signal_time, current_quantity=quantity_held
         )
         st.info(f"**Research agent: {alert.action.value}** · signal through {alert.as_of.date()} · "
                 f"confidence {alert.confidence:.1%}\n\n{alert.explanation}")
         st.caption(f"Model trained on {alert.training_observations:,} historical feature rows. "
-                   f"The simulated fill uses the next available close ({fill_time.date()}) to avoid "
+                   f"Actionable alerts require at least {research_agent.confidence_threshold:.0%} "
+                   f"confidence; lower-confidence predictions stay HOLD. The simulated fill uses "
+                   f"the next available close ({fill_time.date()}) to avoid "
                    "same-bar look-ahead. Predictions are uncertain and are not personalized advice.")
     except AgentError as exc:
         st.warning(f"No alert available: {exc}")

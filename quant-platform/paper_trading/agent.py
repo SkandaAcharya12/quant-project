@@ -12,7 +12,9 @@ from enum import Enum
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -52,12 +54,14 @@ class ResearchAgent:
     Features are close-to-close 5/21/63 bar momentum, 21-bar realized volatility,
     and a 20-vs-60 bar moving-average spread. Scaling is fitted inside each
     decision's training sample. The target is the next bar's return sign, so the
-    latest row is never used as a training label. A confidence threshold avoids
-    turning weak probability differences into forced trades.
+    latest row is never used as a training label. Sigmoid calibration uses
+    forward-only folds inside the training sample. The default 90% confidence
+    threshold avoids turning weak probability differences into forced trades;
+    it can legitimately produce mostly HOLD alerts.
     """
 
     def __init__(self, min_training_observations: int = 126,
-                 confidence_threshold: float = 0.55) -> None:
+                 confidence_threshold: float = 0.90) -> None:
         if min_training_observations < 30:
             raise AgentError("min_training_observations must be at least 30")
         if not 0.5 < confidence_threshold < 1.0:
@@ -105,10 +109,22 @@ class ResearchAgent:
         y = (train.pop("next_return") > 0.0).astype(int)
         if y.nunique() < 2:
             raise AgentError("training sample contains only one return direction")
-        model = make_pipeline(
+        base_model = make_pipeline(
             StandardScaler(),
-            LogisticRegression(C=0.5, class_weight="balanced", max_iter=1_000,
-                               random_state=0, solver="lbfgs"),
+            LogisticRegression(
+                C=0.5,
+                class_weight="balanced",
+                max_iter=1_000,
+                random_state=0,
+                solver="lbfgs",
+            ),
+        )
+        # TimeSeriesSplit avoids using later observations to calibrate earlier
+        # predictions. Calibration is still an estimate, not a guarantee.
+        model = CalibratedClassifierCV(
+            estimator=base_model,
+            method="sigmoid",
+            cv=TimeSeriesSplit(n_splits=3),
         )
         try:
             model.fit(train.to_numpy(dtype=float), y.to_numpy(dtype=int))
@@ -116,7 +132,7 @@ class ResearchAgent:
         except (ValueError, FloatingPointError) as exc:
             raise AgentError(f"could not fit alert model: {exc}") from exc
 
-        classes = model.named_steps["logisticregression"].classes_
+        classes = model.classes_
         probability_up = float(probabilities[int(np.flatnonzero(classes == 1)[0])])
         probability_down = 1.0 - probability_up
         confidence = max(probability_up, probability_down)
@@ -131,7 +147,7 @@ class ResearchAgent:
         evidence = tuple((name, float(value)) for name, value in point.items())
         evidence_text = ", ".join(f"{name}={value:.3%}" for name, value in evidence)
         explanation = (
-            f"Logistic model estimates {probability_up:.1%} probability of a positive next-bar "
+            f"Time-calibrated logistic model estimates {probability_up:.1%} probability of a positive next-bar "
             f"return ({probability_down:.1%} negative). Latest features: {evidence_text}. "
             f"Alert: {action.value}; this is a research signal, not "
             "a forecast guarantee."
