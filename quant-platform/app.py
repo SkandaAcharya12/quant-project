@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover
     make_subplots = None
 
 from backtester import BacktestResult, PairsBacktestConfig, PairsBacktester, screen_pairs
-from data_engine import DataEngine, DataEngineConfig
+from data_engine import DataEngine, DataEngineConfig, DataEngineError
 from optimizer import OptimizationResult, OptimizerConfig, PortfolioOptimizer, WalkForwardResult
 from paper_trading import AgentError, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
@@ -409,8 +409,8 @@ def render_risk(
         st.dataframe(report.factor_stress[["portfolio_return", "pnl_usd"]].round(4))
 
 
-def render_paper_trading(prices: pd.DataFrame) -> None:
-    """Render a user-confirmed paper ledger and an advisory ML alert."""
+def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) -> None:
+    """Render a user-controlled paper ledger, watchlist, and advisory ML alert."""
     st.subheader("Paper trading simulator")
     st.caption("Orders are simulated at the latest available close with configurable slippage and fees. "
                "The research agent only creates alerts; it never places orders.")
@@ -420,16 +420,76 @@ def render_paper_trading(prices: pd.DataFrame) -> None:
 
     state_key = "paper_trading_simulator"
     if state_key not in st.session_state:
+        default_tickers = ", ".join(str(t) for t in prices.columns)
+        ticker_text = st.text_input(
+            "Stocks available to trade (comma-separated)", default_tickers,
+            key="paper_initial_tickers",
+        )
         initial_cash = st.number_input("Starting paper cash ($)", 1_000.0, 10_000_000.0,
                                        100_000.0, 5_000.0, key="paper_initial_cash")
         if not st.button("Start paper account"):
-            st.info("Start an account to practice with the currently loaded market data.")
+            st.info("Choose the stocks for your account, then start it to practice with market data.")
+            return
+        tickers = parse_tickers(ticker_text)
+        if not tickers:
+            st.error("Enter at least one stock ticker.")
+            return
+        data_start = start_date or str(prices.index[0].date())
+        try:
+            paper_prices = _load_paper_prices(prices, tickers, data_start)
+        except (DataEngineError, ValueError, RuntimeError) as exc:
+            st.error(f"Could not load that trading universe: {exc}")
             return
         st.session_state[state_key] = PaperSimulator(
             starting_cash=float(initial_cash), commission_bps=1.0, slippage_bps=2.0
         )
+        st.session_state["paper_tradable_tickers"] = list(tickers)
+        st.session_state["paper_market_data"] = paper_prices
+
     simulator = st.session_state[state_key]
-    history = prices.dropna(how="all").sort_index()
+    # Upgrade an account created by the previous UI version without discarding it.
+    if "paper_market_data" not in st.session_state:
+        st.session_state["paper_market_data"] = prices
+        st.session_state["paper_tradable_tickers"] = list(prices.columns)
+    data_start = start_date or str(prices.index[0].date())
+    with st.expander("Manage tradable stocks"):
+        add_text = st.text_input("New ticker symbol(s)", "", key="paper_add_tickers")
+        if st.button("Add stocks to account", key="add_paper_tickers"):
+            requested_additions = parse_tickers(add_text)
+            current_tickers = list(st.session_state["paper_tradable_tickers"])
+            additions = [ticker for ticker in requested_additions if ticker not in current_tickers]
+            if not additions:
+                st.info("Enter at least one ticker that is not already in this account.")
+            else:
+                combined = tuple(current_tickers + additions)
+                try:
+                    updated_prices = _load_paper_prices(prices, combined, data_start)
+                    st.session_state["paper_market_data"] = updated_prices
+                    st.session_state["paper_tradable_tickers"] = list(combined)
+                except (DataEngineError, ValueError, RuntimeError) as exc:
+                    st.error(f"Could not add the requested ticker(s): {exc}")
+
+        current_tickers = list(st.session_state["paper_tradable_tickers"])
+        remove_ticker = st.selectbox(
+            "Remove a ticker", current_tickers, key="paper_remove_ticker"
+        )
+        if st.button("Remove ticker", key="remove_paper_ticker"):
+            held = {position.symbol for position in simulator.snapshot().positions}
+            if remove_ticker in held:
+                st.error("Close this paper position before removing its ticker.")
+            elif len(current_tickers) == 1:
+                st.error("Keep at least one ticker in the account.")
+            else:
+                remaining = [ticker for ticker in current_tickers if ticker != remove_ticker]
+                st.session_state["paper_market_data"] = st.session_state[
+                    "paper_market_data"
+                ].drop(columns=[remove_ticker])
+                st.session_state["paper_tradable_tickers"] = remaining
+
+    history = st.session_state["paper_market_data"].dropna(how="all").sort_index()
+    if history.empty or history.dropna(how="all").empty:
+        st.warning("No usable price history is available for this account's stocks.")
+        return
     latest = history.dropna(how="all").iloc[-1].dropna()
     simulator.mark({str(k): float(v) for k, v in latest.items()})
     account = simulator.snapshot()
@@ -496,6 +556,27 @@ def render_paper_trading(prices: pd.DataFrame) -> None:
     if st.button("Reset paper account", key="reset_paper_account"):
         del st.session_state[state_key]
         st.rerun()
+
+
+def _load_paper_prices(
+    existing_prices: pd.DataFrame, tickers: tuple[str, ...], start_date: str
+) -> pd.DataFrame:
+    """Use the loaded dashboard panel when possible, otherwise fetch requested symbols."""
+    existing = existing_prices.dropna(how="all").sort_index()
+    if set(tickers).issubset({str(column).upper() for column in existing.columns}):
+        columns = {str(column).upper(): column for column in existing.columns}
+        return existing.loc[:, [columns[ticker] for ticker in tickers]].rename(
+            columns={columns[ticker]: ticker for ticker in tickers}
+        )
+
+    loaded = load_prices(tickers, start_date)
+    columns = {str(column).upper(): column for column in loaded.columns}
+    missing = [ticker for ticker in tickers if ticker not in columns]
+    if missing:
+        raise ValueError(f"No price data returned for: {', '.join(missing)}")
+    return loaded.loc[:, [columns[ticker] for ticker in tickers]].rename(
+        columns={columns[ticker]: ticker for ticker in tickers}
+    )
 
 
 def main() -> None:
@@ -567,7 +648,7 @@ def main() -> None:
                 st.error(f"Risk analysis failed: {exc}")
     with tabs[4]:
         try:
-            render_paper_trading(prices)
+            render_paper_trading(prices, start_s)
         except Exception as exc:  # noqa: BLE001 - isolate optional research UI failures
             st.error(f"Paper trading research tool failed: {exc}")
 

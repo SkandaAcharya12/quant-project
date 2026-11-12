@@ -79,7 +79,7 @@ If one package fails, install it alone, e.g. `pip install statsmodels`, and reru
 
 ## Paper trading research lab
 
-The **Paper trading** tab uses the same cleaned close-price panel as the rest of the dashboard. Start a virtual-cash account, review a next-bar research alert, and choose whether to place a simulated buy, sell, short, or cover order. Alerts never place orders automatically. The order ledger records the reference close, adverse slippage, commission, and timestamp.
+The **Paper trading** tab lets users enter a comma-separated stock universe when creating an account, then add or remove symbols from the account watchlist. New symbols use the same Yahoo Finance data engine and date range as the dashboard; a ticker with an open position cannot be removed until that position is closed. Review a next-bar research alert and choose whether to place a simulated buy, sell, short, or cover order. Alerts never place orders automatically. The order ledger records the reference close, adverse slippage, commission, and timestamp.
 
 The alert model is an expanding-history logistic classifier. It uses trailing momentum, realized volatility, and moving-average spread features to estimate next-bar return direction. At decision time *t*, training labels come only from feature rows before *t*, so each included next-bar return is observable by *t*. The dashboard shows an alert based on the penultimate available close and simulates a fill at the latest close, avoiding same-bar signal/fill look-ahead.
 

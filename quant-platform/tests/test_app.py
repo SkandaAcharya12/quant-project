@@ -241,18 +241,44 @@ class UiWiringTests(unittest.TestCase):
         self.assertIn("title", st.calls)
         self.assertIn("Paper trading", st.tab_labels)
 
-    def test_paper_order_requires_and_records_explicit_user_submission(self) -> None:
-        st = FakeStreamlit({"Start paper account": True, "Place paper order": True})
+    def test_paper_account_uses_selected_tickers_and_can_add_more(self) -> None:
+        st = FakeStreamlit({
+            "Start paper account": True,
+            "Place paper order": True,
+            "Stocks available to trade (comma-separated)": "AAPL, MSFT",
+        })
         prices = pd.DataFrame(
             {"TEST": 100 * np.exp(np.cumsum(np.random.default_rng(9).normal(0.0002, 0.01, 260)))},
             index=pd.bdate_range("2024-01-02", periods=260),
         )
+        selected = pd.DataFrame(
+            {
+                ticker: 100 * np.exp(np.cumsum(np.random.default_rng(seed).normal(0.0002, 0.01, 260)))
+                for ticker, seed in (("AAPL", 20), ("MSFT", 21), ("NVDA", 22))
+            },
+            index=prices.index,
+        )
         with mock.patch.dict(sys.modules, fake_modules(st)):
             app = import_app(st)
-            app.render_paper_trading(prices)
+            with mock.patch.object(app, "load_prices", return_value=selected):
+                app.render_paper_trading(prices, "2024-01-02")
         account = st.session_state["paper_trading_simulator"].snapshot()
         self.assertEqual(len(account.fills), 1)
         self.assertEqual(account.fills[0].action.value, "BUY")
+        self.assertEqual(account.fills[0].symbol, "AAPL")
+        self.assertEqual(st.session_state["paper_tradable_tickers"], ["AAPL", "MSFT"])
+
+        st.overrides.update({"Place paper order": False, "Add stocks to account": True,
+                             "New ticker symbol(s)": "NVDA"})
+        with (
+            mock.patch.dict(sys.modules, fake_modules(st)),
+            mock.patch.object(app, "load_prices", return_value=selected) as fetch_prices,
+        ):
+            app.render_paper_trading(prices, "2024-01-02")
+        fetch_prices.assert_called_once_with(("AAPL", "MSFT", "NVDA"), "2024-01-02")
+        self.assertEqual(
+            st.session_state["paper_tradable_tickers"], ["AAPL", "MSFT", "NVDA"]
+        )
 
     def test_invalid_dates_stop_with_message(self) -> None:
         with self.assertRaises(RuntimeError):
