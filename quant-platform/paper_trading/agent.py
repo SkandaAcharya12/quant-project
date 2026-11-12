@@ -97,7 +97,7 @@ class ResearchAgent:
         if len(series) < self.min_training_observations + 65:
             raise AgentError("insufficient history: need at least min_training_observations + 65 closes")
 
-        feature = self._features(series)
+        feature = self.feature_frame(series)
         next_return = series.pct_change().shift(-1)
         decision_time = series.index[-1]
         # Rows before the decision time have labels ending no later than the
@@ -157,6 +157,11 @@ class ResearchAgent:
                            f"{self.confidence_threshold:.1%} threshold; hold and wait for more evidence.")
         return AgentAlert(symbol.strip().upper(), decision_time, action, probability_up,
                           probability_down, confidence, len(train), evidence, explanation)
+
+    @staticmethod
+    def feature_frame(prices: pd.Series) -> pd.DataFrame:
+        """Expose the exact causal inputs used by the model for chart transparency."""
+        return ResearchAgent._features(prices)
 
     @staticmethod
     def _features(prices: pd.Series) -> pd.DataFrame:
