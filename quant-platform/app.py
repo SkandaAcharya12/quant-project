@@ -45,15 +45,14 @@ from market_engine import (
     TickerCatalogError,
     TickerOption,
 )
-from optimizer import (
-    CVaRFrontier,
-    CVaROptimizer,
+from optimizer.optimizer import (
     OptimizationError,
     OptimizationResult,
     OptimizerConfig,
     PortfolioOptimizer,
     WalkForwardResult,
 )
+from optimizer.tail_risk import CVaRFrontier, CVaROptimizer
 from paper_trading import AgentError, Fill, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
     RiskConfig,
