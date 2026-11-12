@@ -53,7 +53,15 @@ from optimizer.optimizer import (
     WalkForwardResult,
 )
 from optimizer.tail_risk import CVaRFrontier, CVaROptimizer
-from paper_trading import AgentError, Fill, OrderError, PaperSimulator, ResearchAgent, TradeAction
+from paper_trading import (
+    AgentAlert,
+    AgentError,
+    Fill,
+    OrderError,
+    PaperSimulator,
+    ResearchAgent,
+    TradeAction,
+)
 from risk_engine import (
     RiskConfig,
     RiskEngine,
@@ -126,6 +134,16 @@ def _ticker_label(symbol: str, options_by_symbol: dict[str, TickerOption]) -> st
 def load_prices(tickers: tuple[str, ...], start: str) -> pd.DataFrame:
     """Cleaned, gap-free close-price panel from the Data Engine."""
     return DataEngine(DataEngineConfig(start=start)).get_price_panel(list(tickers))
+
+
+@_cache
+def load_ohlcv_history(ticker: str, start: str) -> pd.DataFrame:
+    """Load one symbol's cleaned OHLCV without cross-market panel filling."""
+    symbol = ticker.strip().upper()
+    frames = DataEngine(DataEngineConfig(start=start)).fetch_ohlcv([symbol])
+    if symbol not in frames:
+        raise DataEngineError(f"No OHLCV history returned for {symbol}")
+    return frames[symbol]
 
 
 @_cache_ttl(24 * 60 * 60)
@@ -1258,6 +1276,264 @@ def paper_trade_figure(
     )
 
 
+_PAPER_FEATURES: tuple[tuple[str, str, str], ...] = (
+    ("momentum_5", "5-session momentum", "Price return over the prior 5 sessions."),
+    ("momentum_21", "21-session momentum", "Price return over the prior 21 sessions."),
+    ("momentum_63", "63-session momentum", "Price return over the prior 63 sessions."),
+    (
+        "volatility_21",
+        "21-session realized volatility",
+        "Sample standard deviation of daily returns over the trailing 21 sessions.",
+    ),
+    (
+        "ma_spread_20_60",
+        "20/60-session moving-average spread",
+        "20-session mean divided by the 60-session mean, minus one.",
+    ),
+)
+
+
+def paper_feature_readout(
+    prices: pd.Series,
+    as_of: pd.Timestamp,
+    alert: AgentAlert | None = None,
+) -> pd.DataFrame:
+    """Return the model's named, trailing-only inputs at the displayed cutoff."""
+    if alert is not None and alert.as_of == as_of:
+        values: dict[str, float] = {
+            name: float(value) for name, value in alert.evidence
+        }
+    else:
+        feature_frame = ResearchAgent.feature_frame(prices)
+        if as_of not in feature_frame.index:
+            return pd.DataFrame(columns=("feature", "reading", "definition"))
+        feature_row = feature_frame.loc[[as_of]].iloc[0]
+        values = {
+            str(name): float(value)
+            for name, value in feature_row.items()
+        }
+    rows = [
+        {
+            "feature": label,
+            "reading": float(values[key]),
+            "definition": definition,
+        }
+        for key, label, definition in _PAPER_FEATURES
+        if key in values and np.isfinite(float(values[key]))
+    ]
+    return pd.DataFrame(rows, columns=("feature", "reading", "definition"))
+
+
+def paper_signal_figure(
+    ohlcv: pd.DataFrame,
+    symbol: str,
+    decision_time: pd.Timestamp,
+    alert: AgentAlert | None,
+    fills: tuple[Fill, ...],
+    currency_symbol: str = "$",
+    currency_code: str = "USD",
+    max_candles: int = 180,
+) -> Any | None:
+    """Show real candles plus the exact trailing features used by ``ResearchAgent``.
+
+    Feature traces stop at ``decision_time``. Candles may include the next available
+    close used as a paper-fill reference, making the no-lookahead boundary visible.
+    """
+    required_columns = ("Open", "High", "Low", "Close")
+    if go is None or make_subplots is None or not set(required_columns).issubset(ohlcv.columns):
+        return None
+    history = ohlcv.loc[:, list(required_columns)].apply(pd.to_numeric, errors="coerce")
+    history = history.replace([np.inf, -np.inf], np.nan).dropna().sort_index()
+    history = history.loc[~history.index.duplicated(keep="last")]
+    if history.empty or decision_time not in history.index or max_candles < 2:
+        return None
+    close = history["Close"]
+    features = ResearchAgent.feature_frame(close).loc[:decision_time].dropna(how="all")
+    if features.empty:
+        return None
+
+    visible = history.tail(max_candles)
+    visible_features = features.loc[features.index >= visible.index[0]]
+    figure = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.045,
+        row_heights=(0.62, 0.22, 0.16),
+        subplot_titles=("Adjusted OHLC", "Model momentum and trend inputs", "Model volatility input"),
+    )
+    figure.add_trace(
+        go.Candlestick(
+            x=visible.index,
+            open=visible["Open"],
+            high=visible["High"],
+            low=visible["Low"],
+            close=visible["Close"],
+            name="OHLC candle",
+            increasing_line_color="#0F766E",
+            increasing_fillcolor="#34D399",
+            decreasing_line_color="#DC2626",
+            decreasing_fillcolor="#F87171",
+            whiskerwidth=0.35,
+            hovertemplate=(
+                "%{x|%b %d, %Y}<br>Open: " + currency_symbol + "%{open:,.2f}"
+                "<br>High: " + currency_symbol + "%{high:,.2f}"
+                "<br>Low: " + currency_symbol + "%{low:,.2f}"
+                "<br>Close: " + currency_symbol + "%{close:,.2f}<extra></extra>"
+            ),
+        ),
+        row=1,
+        col=1,
+    )
+    for window, color in ((20, "#2563EB"), (60, "#7C3AED")):
+        average = close.rolling(window, min_periods=window).mean().loc[visible.index]
+        figure.add_trace(
+            go.Scatter(
+                x=visible.index,
+                y=average,
+                mode="lines",
+                name=f"{window}-session SMA",
+                line={"color": color, "width": 1.5},
+                hovertemplate=(
+                    f"%{{x|%b %d, %Y}}<br>{window}-session SMA: "
+                    f"{currency_symbol}%{{y:,.2f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+    action = "FEATURE CUTOFF" if alert is None else alert.action.value
+    signal_color = "#64748B" if alert is None else {
+        "BUY": "#0F766E",
+        "COVER": "#0891B2",
+        "SELL": "#D97706",
+        "SHORT": "#DC2626",
+        "HOLD": "#64748B",
+    }[alert.action.value]
+    confidence_text = "" if alert is None else f" · {alert.confidence:.1%} confidence"
+    signal_close = float(close.loc[decision_time])
+    figure.add_trace(
+        go.Scatter(
+            x=[decision_time],
+            y=[signal_close],
+            mode="markers",
+            name=f"AI {action}",
+            marker={"symbol": "star", "size": 14, "color": signal_color,
+                    "line": {"color": "#FFFFFF", "width": 1}},
+            text=[f"{action}{confidence_text}"],
+            hovertemplate=(
+                "%{text}<br>%{x|%b %d, %Y}<br>Decision close: "
+                + currency_symbol + "%{y:,.2f}<extra></extra>"
+            ),
+        ),
+        row=1,
+        col=1,
+    )
+
+    if history.index[-1] > decision_time:
+        fill_reference_time = history.index[-1]
+        figure.add_trace(
+            go.Scatter(
+                x=[fill_reference_time],
+                y=[float(close.iloc[-1])],
+                mode="markers",
+                name="Next-session fill reference",
+                marker={"symbol": "diamond", "size": 10, "color": "#0891B2",
+                        "line": {"color": "#FFFFFF", "width": 1}},
+                hovertemplate=(
+                    "%{x|%b %d, %Y}<br>Next available close: "
+                    + currency_symbol + "%{y:,.2f}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+    feature_colors = {
+        "momentum_5": "#2563EB",
+        "momentum_21": "#0F766E",
+        "momentum_63": "#7C3AED",
+        "ma_spread_20_60": "#D97706",
+    }
+    for key, label, _ in _PAPER_FEATURES:
+        if key == "volatility_21" or key not in visible_features:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=visible_features.index,
+                y=visible_features[key],
+                mode="lines",
+                name=label,
+                line={"color": feature_colors[key], "width": 1.7},
+                hovertemplate=f"%{{x|%b %d, %Y}}<br>{label}: %{{y:.2%}}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=visible_features.index,
+            y=visible_features["volatility_21"],
+            mode="lines",
+            name="21-session realized volatility",
+            line={"color": "#DC2626", "width": 1.8},
+            hovertemplate=(
+                "%{x|%b %d, %Y}<br>21-session realized volatility: "
+                "%{y:.2%}<extra></extra>"
+            ),
+        ),
+        row=3,
+        col=1,
+    )
+
+    symbol_fills = [fill for fill in fills if fill.symbol == symbol]
+    fill_colors = {"BUY": "#0F766E", "COVER": "#0891B2", "SELL": "#D97706", "SHORT": "#DC2626"}
+    fill_markers = {"BUY": "triangle-up", "COVER": "circle", "SELL": "triangle-down", "SHORT": "triangle-down"}
+    for fill_action in ("BUY", "SELL", "SHORT", "COVER"):
+        action_fills = [fill for fill in symbol_fills if fill.action.value == fill_action]
+        if not action_fills:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=[fill.timestamp for fill in action_fills],
+                y=[fill.fill_price for fill in action_fills],
+                mode="markers",
+                name=f"Paper {fill_action}",
+                marker={"size": 10, "color": fill_colors[fill_action],
+                        "symbol": fill_markers[fill_action],
+                        "line": {"color": "#FFFFFF", "width": 1}},
+                hovertemplate=(
+                    f"Paper {fill_action}<br>%{{x|%b %d, %Y}}<br>Fill: "
+                    f"{currency_symbol}%{{y:,.2f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+    for row in (1, 2, 3):
+        figure.add_vline(
+            x=decision_time,
+            line_dash="dash",
+            line_color="#475569",
+            line_width=1.2,
+            annotation_text="Model cutoff" if row == 1 else None,
+            annotation_position="top left" if row == 1 else None,
+            row=row,
+            col=1,
+        )
+    figure.add_hline(y=0.0, line_dash="dot", line_color="#94A3B8", row=2, col=1)
+    figure.update_yaxes(title_text=f"Price ({currency_code})", tickprefix=currency_symbol,
+                        tickformat=",.2f", row=1, col=1)
+    figure.update_yaxes(title_text="Return / spread", tickformat=".1%", row=2, col=1)
+    figure.update_yaxes(title_text="Daily volatility", tickformat=".1%", row=3, col=1)
+    figure.update_xaxes(title_text="Date", row=3, col=1)
+    figure.update_layout(xaxis_rangeslider_visible=False)
+    title = f"{symbol} · AI signal and model inputs"
+    return _polish_figure(figure, title=title, height=690, hovermode="x unified")
+
+
 def render_paper_trading(
     prices: pd.DataFrame,
     start_date: str | None = None,
@@ -1399,7 +1675,6 @@ def render_paper_trading(
         return
     latest = history.dropna(how="all").iloc[-1].dropna()
     simulator.mark({str(k): float(v) for k, v in latest.items()})
-    account = simulator.snapshot()
 
     tradable_tickers = list(st.session_state[tickers_key])
     ticker = st.selectbox(
@@ -1409,16 +1684,32 @@ def render_paper_trading(
         key=f"{key_prefix}_ticker",
     )
     ticker_history = history[ticker].dropna()
+    ohlcv_history: pd.DataFrame | None = None
+    try:
+        ohlcv_history = load_ohlcv_history(ticker, data_start)
+        raw_close = pd.to_numeric(ohlcv_history["Close"], errors="coerce").dropna().sort_index()
+        if not raw_close.empty:
+            # The model, chart, and next-close fill reference share the same unfilled bars.
+            ticker_history = raw_close
+    except (DataEngineError, ValueError, RuntimeError) as exc:
+        st.warning(
+            f"Candlestick history is unavailable for {ticker}; the AI alert will use "
+            f"the dashboard's close-price history. Details: {exc}"
+        )
     if len(ticker_history) < 2:
         st.warning("At least two closes are required to create an alert and simulate a later fill.")
         return
     signal_time = ticker_history.index[-2]
     fill_time = ticker_history.index[-1]
     fill_price = float(ticker_history.iloc[-1])
+    if ohlcv_history is not None:
+        simulator.mark({ticker: fill_price})
+    account = simulator.snapshot()
     current_position = next((p for p in account.positions if p.symbol == ticker), None)
     quantity_held = 0.0 if current_position is None else current_position.quantity
+    alert: AgentAlert | None = None
+    research_agent = ResearchAgent()
     try:
-        research_agent = ResearchAgent()
         alert = research_agent.evaluate(
             ticker_history, ticker, as_of=signal_time, current_quantity=quantity_held
         )
@@ -1431,6 +1722,41 @@ def render_paper_trading(
                    "same-bar look-ahead. Predictions are uncertain and are not personalized advice.")
     except AgentError as exc:
         st.warning(f"No alert available: {exc}")
+
+    if ohlcv_history is not None:
+        st.markdown("**What the model measured at the decision close**")
+        feature_readout = paper_feature_readout(ticker_history, signal_time, alert)
+        if not feature_readout.empty:
+            _display_table(
+                feature_readout,
+                hide_index=True,
+                percent_columns=("reading",),
+                column_labels={
+                    "feature": "Model input",
+                    "reading": "Value at decision close",
+                    "definition": "Definition",
+                },
+                height=250,
+            )
+        st.caption(
+            "Candles and moving averages provide price context. The lower panels show the "
+            "model's exact trailing momentum, moving-average spread, and realized-volatility "
+            "inputs through the dashed cutoff. The next available candle is shown as the fill "
+            "reference and is excluded from the model features."
+        )
+        signal_chart = paper_signal_figure(
+            ohlcv_history,
+            ticker,
+            signal_time,
+            alert,
+            account.fills,
+            currency_symbol,
+            currency_code,
+        )
+        if signal_chart is not None:
+            _display_chart(signal_chart)
+        else:
+            st.warning("The available OHLC history is too short to draw the AI analysis chart.")
 
     metric_cols = st.columns(4)
     metric_cols[0].metric(f"Equity ({currency_code})", f"{currency_symbol}{account.equity:,.2f}")
