@@ -115,6 +115,9 @@ class FakeStreamlit(types.ModuleType):
     def slider(self, label, min_value=None, max_value=None, value=None, step=None, **_k):  # type: ignore[no-untyped-def]
         return self._value(label, value)
 
+    def select_slider(self, label, options, value=None, **_k):  # type: ignore[no-untyped-def]
+        return self._value(label, value if value is not None else next(iter(options)))
+
     def selectbox(self, label, options, index=0, **_k):  # type: ignore[no-untyped-def]
         return self._value(label, list(options)[index])
 
@@ -214,6 +217,23 @@ class ComputationLayerTests(unittest.TestCase):
         self.assertEqual(len(table), 3)
         self.assertTrue(table.notna().all().all())
 
+    def test_cvar_weights_do_not_depend_on_prices_after_formation(self) -> None:
+        returns = make_returns(3, 600, seed=31)
+        returns.index = pd.bdate_range("2022-01-03", periods=len(returns))
+        prices = to_prices(returns)
+        prices.columns = ["A", "B", "C"]
+        formation_end = str(prices.index[399].date())
+        changed_future = prices.copy()
+        changed_future.loc[changed_future.index > pd.Timestamp(formation_end)] *= 3.0
+
+        baseline = self.app.compute_cvar_frontier(
+            prices, formation_end, 0.95, 0.8, points=5
+        )
+        perturbed = self.app.compute_cvar_frontier(
+            changed_future, formation_end, 0.95, 0.8, points=5
+        )
+        np.testing.assert_allclose(baseline.weights, perturbed.weights, atol=1e-10)
+
     def test_compute_risk_and_short_sample_error(self) -> None:
         w = tuple([1 / 8] * 8)
         macro = pd.DataFrame(np.random.default_rng(0).normal(0, 0.01, (2200, 4)), index=self.prices.index,
@@ -242,6 +262,13 @@ class UiWiringTests(unittest.TestCase):
         self.assertEqual(st.calls.count("dataframe"), 9)
         self.assertIn("title", st.calls)
         self.assertIn("Paper trading", st.tab_labels)
+
+    def test_cvar_lab_renders_when_enabled(self) -> None:
+        st = self._run({"Run CVaR research lab": True})
+        self.assertEqual(st.errors, [], st.errors)
+        self.assertEqual(st.warnings, [], st.warnings)
+        self.assertEqual(st.calls.count("plotly_chart"), 12)
+        self.assertEqual(st.calls.count("dataframe"), 11)
 
     def test_paper_account_uses_selected_tickers_and_can_add_more(self) -> None:
         st = FakeStreamlit({

@@ -6,7 +6,7 @@ Research engines, a paper simulator, and a dashboard:
 |---|---|
 | `data_engine/` | Thread-safe Yahoo Finance ingestion, gap handling, macro indicators, from-scratch technical indicators |
 | `backtester/` | Cointegration-gated pairs trading: rolling Engle-Granger test, Z-score signals, delayed fills, costs |
-| `optimizer/` | Mean-variance optimization with Ledoit-Wolf / Bayes-Stein shrinkage, efficient frontier, 10,000-run Monte Carlo, walk-forward test |
+| `optimizer/` | Mean-variance optimization with Ledoit-Wolf / Bayes-Stein shrinkage, 10,000-run Monte Carlo, walk-forward test, and historical CVaR linear programming |
 | `risk_engine/` | Historical / parametric / Cornish-Fisher / filtered-historical VaR and ES, drawdowns, Kupiec and Christoffersen backtests, stress tests |
 | `market_engine/` | Typed market sections, exchange universes, and local quote-currency metadata |
 | `paper_trading/` | Manual paper orders with an auditable cash/position ledger, explicit costs, and leakage-aware machine-learning alerts |
@@ -77,6 +77,16 @@ If one package fails, install it alone, e.g. `pip install statsmodels`, and reru
 * Optional FRED macro data: copy `.env.example` to `.env` and add a free `FRED_API_KEY`.
 * Every formula is derived in the docstring of the module that uses it.
 * Educational research tool, not investment advice.
+
+## Historical tail-risk optimizer
+
+The Portfolio optimizer tab includes an optional CVaR research lab. It solves the Rockafellar–Uryasev
+linear program over historical formation-period returns and plots minimum expected shortfall against
+feasible annual return floors. Users can inspect the selected asset weights and compare fixed-weight
+out-of-sample returns with the Max Sharpe, minimum-variance, and equal-weight portfolios. The return
+floor uses the arithmetic mean of daily returns annualized by the configured trading-day count; VaR
+and CVaR are one-day loss magnitudes. The LP makes no normal-distribution assumption. Historical tail
+estimates are sample-dependent and do not predict future losses.
 
 ## Paper trading research lab
 

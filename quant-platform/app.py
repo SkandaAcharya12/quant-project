@@ -45,7 +45,15 @@ from market_engine import (
     TickerCatalogError,
     TickerOption,
 )
-from optimizer import OptimizationResult, OptimizerConfig, PortfolioOptimizer, WalkForwardResult
+from optimizer import (
+    CVaRFrontier,
+    CVaROptimizer,
+    OptimizationError,
+    OptimizationResult,
+    OptimizerConfig,
+    PortfolioOptimizer,
+    WalkForwardResult,
+)
 from paper_trading import AgentError, Fill, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
     RiskConfig,
@@ -160,6 +168,21 @@ def compute_optimizer(
     prices: pd.DataFrame, formation_end: str, rf: float, max_weight: float, estimator: str
 ) -> OptimizationResult:
     return _optimizer(rf, max_weight, estimator).optimize(prices.loc[:formation_end])
+
+
+@_cache
+def compute_cvar_frontier(
+    prices: pd.DataFrame,
+    formation_end: str,
+    confidence_level: float,
+    max_weight: float,
+    points: int = 11,
+) -> CVaRFrontier:
+    """Fit CVaR allocations only on returns ending at the formation cutoff."""
+    formation_prices = prices.loc[:formation_end]
+    formation_returns = PortfolioOptimizer.simple_returns(formation_prices)
+    optimizer = CVaROptimizer(OptimizerConfig(max_weight=max_weight))
+    return optimizer.efficient_frontier(formation_returns, confidence_level, points)
 
 
 @_cache
@@ -555,6 +578,44 @@ def fig_weights(result: OptimizationResult) -> Any:
     return _polish_figure(fig, title=title, height=430)
 
 
+def fig_cvar_frontier(frontier: CVaRFrontier, selected_index: int) -> Any:
+    """Plot historical expected shortfall against expected return for feasible targets."""
+    _need_plotly()
+    points = frontier.points
+    selected = points.iloc[selected_index]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=points["expected_shortfall"],
+        y=points["expected_return"],
+        customdata=points[["value_at_risk", "volatility"]].to_numpy(),
+        mode="lines+markers",
+        name=f"{frontier.confidence_level:.0%} CVaR frontier",
+        line={"color": "#7C3AED", "width": 2.5},
+        marker={"size": 8},
+        hovertemplate=(
+            "Expected shortfall: %{x:.2%}<br>Expected return: %{y:.2%}"
+            "<br>VaR: %{customdata[0]:.2%}<br>Volatility: %{customdata[1]:.2%}<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=[selected["expected_shortfall"]],
+        y=[selected["expected_return"]],
+        mode="markers",
+        name="Selected target",
+        marker={"size": 15, "symbol": "star", "color": "#D97706"},
+        hovertemplate="Selected CVaR portfolio<extra></extra>",
+    ))
+    fig.update_xaxes(title_text=f"Historical daily {frontier.confidence_level:.0%} CVaR (loss)",
+                     tickformat=".2%")
+    fig.update_yaxes(title_text="Annualized arithmetic return", tickformat=".1%")
+    return _polish_figure(
+        fig,
+        title="Historical tail-risk efficient frontier",
+        height=460,
+        hovermode="closest",
+    )
+
+
 def fig_walk_forward(wf: WalkForwardResult, oos_start: str) -> Any:
     _need_plotly()
     growth = (1.0 + wf.returns.loc[oos_start:]).cumprod()
@@ -875,7 +936,123 @@ def render_optimizer(
         number_formats={"sharpe": "%.2f"},
     )
     _display_chart(fig_walk_forward(wf, oos_start))
+    render_cvar_lab(prices, formation_end, oos_start, result, rf, max_weight)
     return result
+
+
+def render_cvar_lab(
+    prices: pd.DataFrame,
+    formation_end: str,
+    oos_start: str,
+    optimized: OptimizationResult,
+    rf: float,
+    max_weight: float,
+) -> None:
+    """Offer an optional historical-CVaR allocation and strict out-of-sample check."""
+    with st.expander("Historical tail-risk optimizer (CVaR)"):
+        st.markdown(
+            "The solver minimizes empirical tail loss using formation-period returns. "
+            "It traces the lowest CVaR portfolio at each feasible annual return floor."
+        )
+        st.latex(
+            r"\min_{w,\eta,u}\; \eta + \frac{1}{(1-\alpha)T}\sum_t u_t"
+            r"\quad\text{s.t.}\quad u_t\ge -r_t^\top w-\eta,\;u_t\ge0,"
+            r"\;\mathbf{1}^\top w=1,\;\hat\mu^\top w\ge r_{\min}"
+        )
+        if not st.checkbox("Run CVaR research lab", value=False, key="run_cvar_lab"):
+            st.caption("Enable the lab to calculate the tail-risk frontier for this portfolio universe.")
+            return
+
+        confidence_level = float(st.selectbox(
+            "Tail confidence level",
+            [0.90, 0.95, 0.975, 0.99],
+            index=1,
+            key="cvar_confidence",
+        ))
+        try:
+            frontier = compute_cvar_frontier(
+                prices,
+                formation_end,
+                confidence_level,
+                max_weight,
+                points=11,
+            )
+        except (OptimizationError, ValueError) as exc:
+            st.warning(f"CVaR optimization could not be run: {exc}")
+            return
+
+        points = frontier.points
+        if len(points) > 1:
+            targets = points["target_return"].astype(float).tolist()
+            selected_target = float(st.select_slider(
+                "Minimum annual return target",
+                options=targets,
+                value=targets[len(targets) // 2],
+                format_func=lambda target: f"{target:.1%}",
+                key="cvar_target_index",
+            ))
+            selected_index = int(np.abs(np.asarray(targets) - selected_target).argmin())
+        else:
+            selected_index = 0
+            st.caption("The configured weight bounds leave only one feasible return target.")
+
+        selected = points.iloc[selected_index]
+        weights = frontier.weights.iloc[selected_index].copy()
+        expected_return = float(selected["expected_return"])
+        historical_var = float(selected["value_at_risk"])
+        historical_cvar = float(selected["expected_shortfall"])
+        _display_chart(fig_cvar_frontier(frontier, selected_index))
+
+        oos_returns = PortfolioOptimizer.simple_returns(prices).loc[oos_start:]
+        oos_stats: dict[str, float] | None = None
+        if len(oos_returns) >= 2:
+            evaluator = PortfolioOptimizer(
+                OptimizerConfig(risk_free_rate=rf, max_weight=max_weight)
+            )
+            oos_stats = evaluator.evaluate(weights, oos_returns)
+        else:
+            st.warning("There are fewer than two out-of-sample returns for this target.")
+
+        cards = st.columns(4)
+        cards[0].metric("Return floor", f"{float(selected['target_return']):.1%}")
+        cards[1].metric("Formation return", f"{expected_return:.1%}")
+        cards[2].metric("Historical daily VaR", f"{historical_var:.2%}")
+        cards[3].metric(
+            "Out-of-sample return",
+            f"{oos_stats['ann_return']:.1%}" if oos_stats is not None else "Unavailable",
+        )
+        st.caption(
+            f"Expected shortfall at {confidence_level:.0%}: {historical_cvar:.2%} of daily portfolio value. "
+            "VaR and expected shortfall are loss magnitudes estimated on formation data; "
+            "the next table evaluates fixed weights after the formation cutoff."
+        )
+
+        st.markdown("**Selected formation-period weights**")
+        weight_table = weights.rename("Weight").sort_values(ascending=False).to_frame()
+        _display_table(weight_table, index_name="Asset", percent_columns=("Weight",))
+
+        if oos_stats is not None:
+            comparison_rows = {
+                "Minimum CVaR": oos_stats,
+                "Max Sharpe": evaluator.evaluate(optimized.max_sharpe.weights, oos_returns),
+                "Min variance": evaluator.evaluate(optimized.gmv.weights, oos_returns),
+                "Equal weight": evaluator.evaluate(optimized.equal_weight.weights, oos_returns),
+            }
+            comparison = pd.DataFrame(comparison_rows).T[
+                ["ann_return", "ann_volatility", "sharpe", "max_drawdown"]
+            ]
+            _display_table(
+                comparison,
+                index_name="Portfolio",
+                percent_columns=("ann_return", "ann_volatility", "max_drawdown"),
+                number_formats={"sharpe": "%.2f"},
+                column_labels={
+                    "ann_return": "Annualized return",
+                    "ann_volatility": "Annualized volatility",
+                    "max_drawdown": "Maximum drawdown",
+                    "sharpe": "Sharpe ratio",
+                },
+            )
 
 
 def render_risk(
