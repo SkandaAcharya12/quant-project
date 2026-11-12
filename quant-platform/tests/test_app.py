@@ -20,6 +20,7 @@ import pandas as pd
 from typing_extensions import Self
 
 import data_engine.data_engine as de
+from market_engine import TickerOption
 from tests.test_optimizer import make_returns, to_prices
 
 # --------------------------------------------------------------------------- #
@@ -228,7 +229,8 @@ class UiWiringTests(unittest.TestCase):
         st = FakeStreamlit(overrides)
         with mock.patch.dict(sys.modules, fake_modules(st)), mock.patch.object(de, "yf", FakeYahoo()):
             app = import_app(st)
-            app.main()
+            with mock.patch.object(app, "load_market_ticker_catalog", return_value=()):
+                app.main()
         return st
 
     def test_full_dashboard_renders_without_errors(self) -> None:
@@ -245,8 +247,13 @@ class UiWiringTests(unittest.TestCase):
         st = FakeStreamlit({
             "Start paper account": True,
             "Place paper order": True,
-            "Stocks available to trade (comma-separated)": "AAPL, MSFT",
+            "Stocks available to trade": ["AAPL", "MSFT"],
         })
+        ticker_catalog = (
+            TickerOption("AAPL", "Apple Inc."),
+            TickerOption("MSFT", "Microsoft Corporation"),
+            TickerOption("NVDA", "NVIDIA Corporation"),
+        )
         prices = pd.DataFrame(
             {"TEST": 100 * np.exp(np.cumsum(np.random.default_rng(9).normal(0.0002, 0.01, 260)))},
             index=pd.bdate_range("2024-01-02", periods=260),
@@ -261,7 +268,9 @@ class UiWiringTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, fake_modules(st)):
             app = import_app(st)
             with mock.patch.object(app, "load_prices", return_value=selected):
-                app.render_paper_trading(prices, "2024-01-02")
+                app.render_paper_trading(
+                    prices, "2024-01-02", ticker_catalog=ticker_catalog
+                )
         account = st.session_state["paper_default_simulator"].snapshot()
         self.assertEqual(len(account.fills), 1)
         self.assertEqual(account.fills[0].action.value, "BUY")
@@ -270,12 +279,14 @@ class UiWiringTests(unittest.TestCase):
         self.assertGreaterEqual(st.calls.count("plotly_chart"), 1)
 
         st.overrides.update({"Place paper order": False, "Add stocks to account": True,
-                             "New ticker symbol(s)": "NVDA"})
+                             "Stocks to add": ["NVDA"]})
         with (
             mock.patch.dict(sys.modules, fake_modules(st)),
             mock.patch.object(app, "load_prices", return_value=selected) as fetch_prices,
         ):
-            app.render_paper_trading(prices, "2024-01-02")
+            app.render_paper_trading(
+                prices, "2024-01-02", ticker_catalog=ticker_catalog
+            )
         fetch_prices.assert_called_once_with(("AAPL", "MSFT", "NVDA"), "2024-01-02")
         self.assertEqual(
             st.session_state["paper_default_tradable_tickers"], ["AAPL", "MSFT", "NVDA"]
@@ -298,18 +309,26 @@ class UiWiringTests(unittest.TestCase):
         )
 
     def test_invalid_dates_stop_with_message(self) -> None:
-        with self.assertRaises(RuntimeError):
-            st = FakeStreamlit({"Out-of-sample starts": dt.date(2017, 1, 1)})
-            with mock.patch.dict(sys.modules, fake_modules(st)):
-                import_app(st).main()
+        st = FakeStreamlit({"Out-of-sample starts": dt.date(2017, 1, 1)})
+        with mock.patch.dict(sys.modules, fake_modules(st)):
+            app = import_app(st)
+            with (
+                mock.patch.object(app, "load_market_ticker_catalog", return_value=()),
+                self.assertRaises(RuntimeError),
+            ):
+                app.main()
         self.assertTrue(any("Dates must satisfy" in m for m in st.errors))
 
     def test_bad_universe_surfaces_error_instead_of_crashing(self) -> None:
-        st = FakeStreamlit({"Portfolio universe (tickers)": "SPY"})  # one asset: optimizer cannot run
+        st = FakeStreamlit({"Portfolio stocks": ["SPY"]})
         with mock.patch.dict(sys.modules, fake_modules(st)), mock.patch.object(de, "yf", FakeYahoo()):
-            import_app(st).main()
-        self.assertTrue(any("Optimization failed" in m for m in st.errors), st.errors)
-        self.assertTrue(any("needs a successful portfolio optimization" in m for m in st.warnings))
+            app = import_app(st)
+            with (
+                mock.patch.object(app, "load_market_ticker_catalog", return_value=()),
+                self.assertRaises(RuntimeError),
+            ):
+                app.main()
+        self.assertTrue(any("Choose at least two stocks" in m for m in st.errors), st.errors)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -36,7 +37,13 @@ except ImportError:  # pragma: no cover
 
 from backtester import BacktestResult, PairsBacktestConfig, PairsBacktester, screen_pairs
 from data_engine import DataEngine, DataEngineConfig, DataEngineError
-from market_engine import MARKET_SECTIONS, MarketSection
+from market_engine import (
+    MARKET_SECTIONS,
+    MarketSection,
+    TickerCatalog,
+    TickerCatalogError,
+    TickerOption,
+)
 from optimizer import OptimizationResult, OptimizerConfig, PortfolioOptimizer, WalkForwardResult
 from paper_trading import AgentError, Fill, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
@@ -56,6 +63,18 @@ def _cache(func: Any) -> Any:
     return st.cache_data(show_spinner=False)(func) if st is not None else func
 
 
+def _cache_ttl(
+    ttl_seconds: int,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Cache remote reference data for a bounded interval when Streamlit is present."""
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        if st is None:
+            return func
+        return cast(Callable[..., Any], st.cache_data(ttl=ttl_seconds, show_spinner=False)(func))
+
+    return decorate
+
+
 # --------------------------------------------------------------------------- #
 # Computation layer (pure functions; no UI calls)
 # --------------------------------------------------------------------------- #
@@ -65,10 +84,46 @@ def parse_tickers(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(t.strip().upper() for t in cleaned if t.strip()))
 
 
+def _stored_tickers(value: object) -> tuple[str, ...] | None:
+    """Read saved multiselect state or migrate an older comma-separated value."""
+    if isinstance(value, str):
+        return parse_tickers(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(dict.fromkeys(
+            ticker.strip().upper() for ticker in value
+            if isinstance(ticker, str) and ticker.strip()
+        ))
+    return None
+
+
+def _ticker_menu(
+    catalog: Iterable[TickerOption], include: Iterable[str] = ()
+) -> tuple[tuple[str, ...], dict[str, TickerOption]]:
+    """Combine a remote catalog with saved/default symbols and display metadata."""
+    options_by_symbol = {option.symbol: option for option in catalog}
+    for ticker in include:
+        symbol = ticker.strip().upper()
+        if symbol and symbol not in options_by_symbol:
+            options_by_symbol[symbol] = TickerOption(symbol=symbol, name=symbol)
+    return tuple(options_by_symbol), options_by_symbol
+
+
+def _ticker_label(symbol: str, options_by_symbol: dict[str, TickerOption]) -> str:
+    """Return a name-plus-symbol label for a ticker dropdown option."""
+    option = options_by_symbol.get(symbol)
+    return option.display_label if option is not None else symbol
+
+
 @_cache
 def load_prices(tickers: tuple[str, ...], start: str) -> pd.DataFrame:
     """Cleaned, gap-free close-price panel from the Data Engine."""
     return DataEngine(DataEngineConfig(start=start)).get_price_panel(list(tickers))
+
+
+@_cache_ttl(24 * 60 * 60)
+def load_market_ticker_catalog(market_key: str) -> tuple[TickerOption, ...]:
+    """Retrieve and cache a region's searchable security list for one day."""
+    return TickerCatalog().fetch(market_key)
 
 
 @_cache
@@ -471,6 +526,7 @@ def render_paper_trading(
     market_key: str = "default",
     currency_code: str = "USD",
     currency_symbol: str = "$",
+    ticker_catalog: tuple[TickerOption, ...] = (),
 ) -> None:
     """Render a user-controlled paper ledger, watchlist, and advisory ML alert."""
     st.subheader("Paper trading simulator")
@@ -494,11 +550,24 @@ def render_paper_trading(
                 st.session_state[tickers_key] = st.session_state["paper_tradable_tickers"]
             if "paper_market_data" in st.session_state:
                 st.session_state[market_data_key] = st.session_state["paper_market_data"]
+    ticker_selection_key = f"{key_prefix}_initial_ticker_selection"
+    saved_selection = _stored_tickers(st.session_state.get(ticker_selection_key))
+    if saved_selection is None:
+        saved_selection = _stored_tickers(st.session_state.get(f"{key_prefix}_initial_tickers"))
+    initial_tickers = saved_selection if saved_selection is not None else tuple(
+        str(ticker).upper() for ticker in prices.columns
+    )
+    picker_tickers, picker_labels = _ticker_menu(
+        ticker_catalog, (*prices.columns, *initial_tickers)
+    )
     if state_key not in st.session_state:
-        default_tickers = ", ".join(str(t) for t in prices.columns)
-        ticker_text = st.text_input(
-            "Stocks available to trade (comma-separated)", default_tickers,
-            key=f"{key_prefix}_initial_tickers",
+        selected_tickers = st.multiselect(
+            "Stocks available to trade",
+            picker_tickers,
+            default=list(initial_tickers),
+            format_func=lambda symbol: _ticker_label(symbol, picker_labels),
+            help="Search by company name or ticker, then select multiple stocks for this paper account.",
+            key=ticker_selection_key,
         )
         initial_cash = st.number_input(
             f"Starting paper cash ({currency_code})", 1_000.0, 10_000_000.0,
@@ -507,9 +576,9 @@ def render_paper_trading(
         if not st.button("Start paper account", key=f"{key_prefix}_start_account"):
             st.info("Choose the stocks for your account, then start it to practice with market data.")
             return
-        tickers = parse_tickers(ticker_text)
+        tickers = tuple(dict.fromkeys(str(ticker).strip().upper() for ticker in selected_tickers))
         if not tickers:
-            st.error("Enter at least one stock ticker.")
+            st.error("Choose at least one stock for the paper account.")
             return
         data_start = start_date or str(prices.index[0].date())
         try:
@@ -530,13 +599,28 @@ def render_paper_trading(
         st.session_state[tickers_key] = list(prices.columns)
     data_start = start_date or str(prices.index[0].date())
     with st.expander(f"Manage {market_key.upper()} tradable stocks"):
-        add_text = st.text_input("New ticker symbol(s)", "", key=f"{key_prefix}_add_tickers")
+        current_tickers = list(st.session_state[tickers_key])
+        account_picker_tickers, account_picker_labels = _ticker_menu(
+            ticker_catalog, (*picker_tickers, *current_tickers)
+        )
+        addable_tickers = tuple(
+            ticker for ticker in account_picker_tickers if ticker not in current_tickers
+        )
+        requested_additions = st.multiselect(
+            "Stocks to add",
+            addable_tickers,
+            format_func=lambda symbol: _ticker_label(symbol, account_picker_labels),
+            help="Search the regional stock list by company name or ticker.",
+            key=f"{key_prefix}_add_ticker_selection",
+        )
         if st.button("Add stocks to account", key=f"{key_prefix}_add_button"):
-            requested_additions = parse_tickers(add_text)
-            current_tickers = list(st.session_state[tickers_key])
-            additions = [ticker for ticker in requested_additions if ticker not in current_tickers]
+            additions = [
+                str(ticker).strip().upper()
+                for ticker in requested_additions
+                if str(ticker).strip().upper() not in current_tickers
+            ]
             if not additions:
-                st.info("Enter at least one ticker that is not already in this account.")
+                st.info("Choose at least one stock that is not already in this account.")
             else:
                 combined = tuple(current_tickers + additions)
                 try:
@@ -556,7 +640,10 @@ def render_paper_trading(
 
         current_tickers = list(st.session_state[tickers_key])
         remove_ticker = st.selectbox(
-            "Remove a ticker", current_tickers, key=f"{key_prefix}_remove_ticker"
+            "Remove a stock",
+            current_tickers,
+            format_func=lambda symbol: _ticker_label(symbol, account_picker_labels),
+            key=f"{key_prefix}_remove_ticker",
         )
         if st.button("Remove ticker", key=f"{key_prefix}_remove_button"):
             held = {position.symbol for position in simulator.snapshot().positions}
@@ -577,7 +664,12 @@ def render_paper_trading(
     account = simulator.snapshot()
 
     tradable_tickers = list(st.session_state[tickers_key])
-    ticker = st.selectbox("Instrument", tradable_tickers, key=f"{key_prefix}_ticker")
+    ticker = st.selectbox(
+        "Instrument",
+        tradable_tickers,
+        format_func=lambda symbol: _ticker_label(symbol, account_picker_labels),
+        key=f"{key_prefix}_ticker",
+    )
     ticker_history = history[ticker].dropna()
     if len(ticker_history) < 2:
         st.warning("At least two closes are required to create an alert and simulate a later fill.")
@@ -699,14 +791,64 @@ def main() -> None:
             "Market section", MARKET_SECTIONS, format_func=lambda item: item.name,
             key="market_section",
         )
-        universe_text = st.text_area(
-            "Portfolio universe (tickers)", ", ".join(market.portfolio_tickers),
-            key=f"portfolio_universe_{market.key}",
+
+    try:
+        with st.spinner(f"Loading {market.name} ticker choices..."):
+            ticker_catalog = load_market_ticker_catalog(market.key)
+    except TickerCatalogError as exc:
+        logger.warning("Regional ticker catalog unavailable: %s", exc)
+        ticker_catalog = ()
+        st.warning(
+            "The expanded ticker directory is temporarily unavailable. The built-in market "
+            "choices remain available; try again later to browse the full list."
         )
-        pairs_text = st.text_input(
-            "Pairs universe (tickers)", ", ".join(market.pairs_tickers),
-            key=f"pairs_universe_{market.key}",
+
+    portfolio_state_key = f"portfolio_ticker_selection_{market.key}"
+    pairs_state_key = f"pairs_ticker_selection_{market.key}"
+    saved_portfolio = _stored_tickers(st.session_state.get(portfolio_state_key))
+    saved_pairs = _stored_tickers(st.session_state.get(pairs_state_key))
+    if saved_portfolio is None:
+        saved_portfolio = _stored_tickers(
+            st.session_state.get(f"portfolio_universe_{market.key}")
         )
+    if saved_pairs is None:
+        saved_pairs = _stored_tickers(st.session_state.get(f"pairs_universe_{market.key}"))
+    portfolio_default = saved_portfolio or market.portfolio_tickers
+    pairs_default = saved_pairs or market.pairs_tickers
+    portfolio_options, portfolio_labels = _ticker_menu(
+        ticker_catalog, (*market.portfolio_tickers, *portfolio_default)
+    )
+    pairs_options, pairs_labels = _ticker_menu(
+        ticker_catalog, (*market.pairs_tickers, *pairs_default)
+    )
+
+    with st.sidebar:
+        if ticker_catalog:
+            st.caption(
+                f"Browsing {len(ticker_catalog)} regional listings. Search by company name or ticker."
+            )
+        portfolio_selection = st.multiselect(
+            "Portfolio stocks",
+            portfolio_options,
+            default=list(portfolio_default),
+            format_func=lambda symbol: _ticker_label(symbol, portfolio_labels),
+            help="Search by company name or ticker, then choose multiple stocks for analysis.",
+            key=portfolio_state_key,
+        )
+        portfolio_tickers = _stored_tickers(portfolio_selection)
+        if portfolio_tickers is None:
+            portfolio_tickers = portfolio_default
+        pairs_selection = st.multiselect(
+            "Pairs trading stocks",
+            pairs_options,
+            default=list(pairs_default),
+            format_func=lambda symbol: _ticker_label(symbol, pairs_labels),
+            help="Choose at least two stocks to search for cointegrated pairs.",
+            key=pairs_state_key,
+        )
+        pairs_tickers = _stored_tickers(pairs_selection)
+        if pairs_tickers is None:
+            pairs_tickers = pairs_default
         start = st.date_input("History starts", dt.date(2018, 1, 1))
         formation_end = st.date_input("Formation period ends", dt.date(2024, 12, 31))
         oos_start = st.date_input("Out-of-sample starts", dt.date(2025, 1, 1))
@@ -724,6 +866,12 @@ def main() -> None:
     if not start < formation_end < oos_start:
         st.error("Dates must satisfy: history start < formation end < out-of-sample start.")
         st.stop()
+    if len(portfolio_tickers) < 2:
+        st.error("Choose at least two stocks for portfolio research.")
+        st.stop()
+    if len(pairs_tickers) < 2:
+        st.error("Choose at least two stocks for pairs trading.")
+        st.stop()
     start_s, formation_s, oos_s = str(start), str(formation_end), str(oos_start)
     st.header(f"{market.name} market section")
     st.caption(
@@ -734,8 +882,8 @@ def main() -> None:
 
     try:
         with st.spinner("Downloading and cleaning market data..."):
-            prices = load_prices(parse_tickers(universe_text), start_s)
-            pair_prices = load_prices(parse_tickers(pairs_text), start_s)
+            prices = load_prices(tuple(portfolio_tickers), start_s)
+            pair_prices = load_prices(tuple(pairs_tickers), start_s)
     except Exception as exc:  # noqa: BLE001 - surface any data problem to the user, never crash the page
         st.error(f"Could not load market data: {exc}")
         st.stop()
@@ -776,7 +924,12 @@ def main() -> None:
     with tabs[4]:
         try:
             render_paper_trading(
-                prices, start_s, market.key, market.currency_code, market.currency_symbol
+                prices,
+                start_s,
+                market.key,
+                market.currency_code,
+                market.currency_symbol,
+                ticker_catalog,
             )
         except Exception as exc:  # noqa: BLE001 - isolate optional research UI failures
             st.error(f"Paper trading research tool failed: {exc}")

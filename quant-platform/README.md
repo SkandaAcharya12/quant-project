@@ -90,3 +90,5 @@ This is an educational simulation, not a broker connection or trading recommenda
 
 Use **Market section** in the sidebar to switch between the United States, United Kingdom, Eurozone, Japan, India, and Canada. Each section has its own editable portfolio and pairs universes, plus the same market data, pairs, optimizer, risk, and paper-trading tabs. Paper balances and watchlists are isolated by market. Foreign-market prices, risk values, and paper accounts remain in local quote currency (including GBp for London listings); they are not converted to USD. The macro dashboard is shared and currently uses U.S. indicators, so foreign-market macro context is not region-specific.
 
+Portfolio, pairs, and paper-account stock pickers are searchable multi-select lists. They show company names, exchange names, and ticker symbols, and load up to 250 regional equity results from Yahoo Finance, cached for one day. Existing regional defaults remain available if that lookup is temporarily unavailable. Yahoo listing coverage can vary; the price data engine validates selected symbols when it downloads history.
+
