@@ -727,7 +727,7 @@ def main() -> None:
     start_s, formation_s, oos_s = str(start), str(formation_end), str(oos_start)
     st.header(f"{market.name} market section")
     st.caption(
-        f"{market.quote_note}. Returns, risk values, and paper accounts use local quote currency "
+        f"{market.quote_note}. Prices, risk values, and paper accounts use local quote currency "
         f"({market.currency_code}) and are not converted to USD. The macro panel uses the platform's "
         "shared U.S. indicators."
     )
