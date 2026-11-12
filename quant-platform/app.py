@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
 
 from backtester import BacktestResult, PairsBacktestConfig, PairsBacktester, screen_pairs
 from data_engine import DataEngine, DataEngineConfig, DataEngineError
+from market_engine import MARKET_SECTIONS, MarketSection
 from optimizer import OptimizationResult, OptimizerConfig, PortfolioOptimizer, WalkForwardResult
 from paper_trading import AgentError, Fill, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
@@ -47,8 +48,6 @@ from risk_engine import (
 
 logger = logging.getLogger(__name__)
 
-PAIRS_DEFAULT = "KO, PEP, XOM, CVX"
-UNIVERSE_DEFAULT = "SPY, QQQ, IWM, EFA, TLT, GLD, XLE, XLV"
 TEMPLATE = "plotly_white"
 
 
@@ -223,7 +222,7 @@ def fig_walk_forward(wf: WalkForwardResult, oos_start: str) -> Any:
     _need_plotly()
     growth = (1.0 + wf.returns.loc[oos_start:]).cumprod()
     fig = go.Figure([go.Scatter(x=growth.index, y=growth[c], name=c, mode="lines") for c in growth])
-    fig.update_layout(template=TEMPLATE, title="Walk-forward growth of $1 (out-of-sample, after costs)")
+    fig.update_layout(template=TEMPLATE, title="Walk-forward growth of one unit (out-of-sample, after costs)")
     return fig
 
 
@@ -363,6 +362,7 @@ def render_optimizer(
 def render_risk(
     prices: pd.DataFrame, macro: pd.DataFrame, optimized: OptimizationResult, value: float,
     horizon: int, confidences: tuple[float, ...], oos_start: str, start_date: str,
+    currency_code: str = "USD", currency_symbol: str = "$",
 ) -> None:
     choice = st.radio("Portfolio to analyze", ["Max Sharpe", "Min variance", "Equal weight (1/N)"], horizontal=True)
     port = {"Max Sharpe": optimized.max_sharpe, "Min variance": optimized.gmv,
@@ -379,11 +379,16 @@ def render_risk(
     table = report.var_table
     hist = table.loc[("Historical", alpha)]
     m = st.columns(4)
-    m[0].metric(f"{alpha:.0%} VaR (historical)", f"${hist['var_usd']:,.0f}", _fmt_pct(-hist["var"]))
-    m[1].metric(f"{alpha:.0%} Expected shortfall", f"${hist['es_usd']:,.0f}", _fmt_pct(-hist["es"]))
+    m[0].metric(f"{alpha:.0%} VaR (historical)", f"{currency_symbol}{hist['var_usd']:,.0f}",
+                _fmt_pct(-hist["var"]))
+    m[1].metric(f"{alpha:.0%} Expected shortfall", f"{currency_symbol}{hist['es_usd']:,.0f}",
+                _fmt_pct(-hist["es"]))
     m[2].metric("Max drawdown", _fmt_pct(report.drawdown.max_drawdown))
     m[3].metric("Current drawdown", _fmt_pct(report.drawdown.current_drawdown))
-    st.dataframe(table.round(4))
+    st.dataframe(table.rename(columns={
+        "var_usd": f"VaR ({currency_code})",
+        "es_usd": f"Expected shortfall ({currency_code})",
+    }).round(4))
     st.plotly_chart(fig_return_distribution(report, alpha))
     st.plotly_chart(fig_drawdown(report))
     st.dataframe(report.drawdown.episodes)
@@ -404,12 +409,18 @@ def render_risk(
                "factor shocks through estimated sensitivities: they assume linear betas and ignore the "
                "correlation spike seen in real crises, so treat them as illustrations, not forecasts.")
     st.plotly_chart(fig_stress(report))
-    st.dataframe(report.historical_stress)
+    st.dataframe(report.historical_stress.rename(columns={
+        "pnl_usd": f"P&L ({currency_code})"
+    }))
     if report.factor_stress is not None and not report.factor_stress.empty:
-        st.dataframe(report.factor_stress[["portfolio_return", "pnl_usd"]].round(4))
+        st.dataframe(report.factor_stress[["portfolio_return", "pnl_usd"]].rename(
+            columns={"pnl_usd": f"P&L ({currency_code})"}
+        ).round(4))
 
 
-def paper_trade_figure(prices: pd.Series, symbol: str, fills: tuple[Fill, ...]) -> Any | None:
+def paper_trade_figure(
+    prices: pd.Series, symbol: str, fills: tuple[Fill, ...], currency_symbol: str = "$"
+) -> Any | None:
     """Plot close history and every simulated fill for one symbol."""
     history = pd.to_numeric(prices, errors="coerce").dropna().sort_index()
     if go is None or history.empty:
@@ -438,15 +449,15 @@ def paper_trade_figure(prices: pd.Series, symbol: str, fills: tuple[Fill, ...]) 
             text=[f"{fill.action.value} {fill.quantity:g} shares" for fill in symbol_fills],
             customdata=[[fill.reference_price, fill.commission] for fill in symbol_fills],
             hovertemplate=(
-                "%{text}<br>%{x}<br>Fill: $%{y:.2f}"
-                "<br>Reference: $%{customdata[0]:.2f}"
-                "<br>Commission: $%{customdata[1]:.2f}<extra></extra>"
+                f"%{{text}}<br>%{{x}}<br>Fill: {currency_symbol}%{{y:.2f}}"
+                f"<br>Reference: {currency_symbol}%{{customdata[0]:.2f}}"
+                f"<br>Commission: {currency_symbol}%{{customdata[1]:.2f}}<extra></extra>"
             ),
         ))
     figure.update_layout(
         title=f"{symbol} close price and paper trades",
         xaxis_title="Date",
-        yaxis_title="Price ($)",
+        yaxis_title=f"Price ({currency_symbol})",
         template=TEMPLATE,
         hovermode="closest",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
@@ -454,25 +465,46 @@ def paper_trade_figure(prices: pd.Series, symbol: str, fills: tuple[Fill, ...]) 
     return figure
 
 
-def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) -> None:
+def render_paper_trading(
+    prices: pd.DataFrame,
+    start_date: str | None = None,
+    market_key: str = "default",
+    currency_code: str = "USD",
+    currency_symbol: str = "$",
+) -> None:
     """Render a user-controlled paper ledger, watchlist, and advisory ML alert."""
     st.subheader("Paper trading simulator")
-    st.caption("Orders are simulated at the latest available close with configurable slippage and fees. "
+    st.caption(f"Prices, cash, and P&L use the market's local quote currency ({currency_code}); no FX "
+               "conversion is applied. Orders simulate the latest close with fees and slippage. "
                "The research agent only creates alerts; it never places orders.")
     if prices.empty or prices.dropna(how="all").empty:
         st.warning("Price history is unavailable for the simulator.")
         return
 
-    state_key = "paper_trading_simulator"
+    key_prefix = f"paper_{market_key}"
+    state_key = f"{key_prefix}_simulator"
+    tickers_key = f"{key_prefix}_tradable_tickers"
+    market_data_key = f"{key_prefix}_market_data"
+    # Preserve the original US account through the change to market-scoped keys.
+    if market_key == "us" and state_key not in st.session_state:
+        legacy = st.session_state.get("paper_trading_simulator")
+        if legacy is not None:
+            st.session_state[state_key] = legacy
+            if "paper_tradable_tickers" in st.session_state:
+                st.session_state[tickers_key] = st.session_state["paper_tradable_tickers"]
+            if "paper_market_data" in st.session_state:
+                st.session_state[market_data_key] = st.session_state["paper_market_data"]
     if state_key not in st.session_state:
         default_tickers = ", ".join(str(t) for t in prices.columns)
         ticker_text = st.text_input(
             "Stocks available to trade (comma-separated)", default_tickers,
-            key="paper_initial_tickers",
+            key=f"{key_prefix}_initial_tickers",
         )
-        initial_cash = st.number_input("Starting paper cash ($)", 1_000.0, 10_000_000.0,
-                                       100_000.0, 5_000.0, key="paper_initial_cash")
-        if not st.button("Start paper account"):
+        initial_cash = st.number_input(
+            f"Starting paper cash ({currency_code})", 1_000.0, 10_000_000.0,
+            100_000.0, 5_000.0, key=f"{key_prefix}_initial_cash",
+        )
+        if not st.button("Start paper account", key=f"{key_prefix}_start_account"):
             st.info("Choose the stocks for your account, then start it to practice with market data.")
             return
         tickers = parse_tickers(ticker_text)
@@ -488,20 +520,20 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
         st.session_state[state_key] = PaperSimulator(
             starting_cash=float(initial_cash), commission_bps=1.0, slippage_bps=2.0
         )
-        st.session_state["paper_tradable_tickers"] = list(tickers)
-        st.session_state["paper_market_data"] = paper_prices
+        st.session_state[tickers_key] = list(tickers)
+        st.session_state[market_data_key] = paper_prices
 
     simulator = st.session_state[state_key]
     # Upgrade an account created by the previous UI version without discarding it.
-    if "paper_market_data" not in st.session_state:
-        st.session_state["paper_market_data"] = prices
-        st.session_state["paper_tradable_tickers"] = list(prices.columns)
+    if market_data_key not in st.session_state:
+        st.session_state[market_data_key] = prices
+        st.session_state[tickers_key] = list(prices.columns)
     data_start = start_date or str(prices.index[0].date())
-    with st.expander("Manage tradable stocks"):
-        add_text = st.text_input("New ticker symbol(s)", "", key="paper_add_tickers")
-        if st.button("Add stocks to account", key="add_paper_tickers"):
+    with st.expander(f"Manage {market_key.upper()} tradable stocks"):
+        add_text = st.text_input("New ticker symbol(s)", "", key=f"{key_prefix}_add_tickers")
+        if st.button("Add stocks to account", key=f"{key_prefix}_add_button"):
             requested_additions = parse_tickers(add_text)
-            current_tickers = list(st.session_state["paper_tradable_tickers"])
+            current_tickers = list(st.session_state[tickers_key])
             additions = [ticker for ticker in requested_additions if ticker not in current_tickers]
             if not additions:
                 st.info("Enter at least one ticker that is not already in this account.")
@@ -509,7 +541,7 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                 combined = tuple(current_tickers + additions)
                 try:
                     updated_prices = _load_paper_prices(prices, combined, data_start)
-                    old_history = st.session_state["paper_market_data"]
+                    old_history = st.session_state[market_data_key]
                     archived = [
                         ticker for ticker in old_history.columns if str(ticker).upper() not in combined
                     ]
@@ -517,16 +549,16 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                         updated_prices = pd.concat(
                             [old_history.loc[:, archived], updated_prices], axis=1
                         ).sort_index()
-                    st.session_state["paper_market_data"] = updated_prices
-                    st.session_state["paper_tradable_tickers"] = list(combined)
+                    st.session_state[market_data_key] = updated_prices
+                    st.session_state[tickers_key] = list(combined)
                 except (DataEngineError, ValueError, RuntimeError) as exc:
                     st.error(f"Could not add the requested ticker(s): {exc}")
 
-        current_tickers = list(st.session_state["paper_tradable_tickers"])
+        current_tickers = list(st.session_state[tickers_key])
         remove_ticker = st.selectbox(
-            "Remove a ticker", current_tickers, key="paper_remove_ticker"
+            "Remove a ticker", current_tickers, key=f"{key_prefix}_remove_ticker"
         )
-        if st.button("Remove ticker", key="remove_paper_ticker"):
+        if st.button("Remove ticker", key=f"{key_prefix}_remove_button"):
             held = {position.symbol for position in simulator.snapshot().positions}
             if remove_ticker in held:
                 st.error("Close this paper position before removing its ticker.")
@@ -534,9 +566,9 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                 st.error("Keep at least one ticker in the account.")
             else:
                 remaining = [ticker for ticker in current_tickers if ticker != remove_ticker]
-                st.session_state["paper_tradable_tickers"] = remaining
+                st.session_state[tickers_key] = remaining
 
-    history = st.session_state["paper_market_data"].dropna(how="all").sort_index()
+    history = st.session_state[market_data_key].dropna(how="all").sort_index()
     if history.empty or history.dropna(how="all").empty:
         st.warning("No usable price history is available for this account's stocks.")
         return
@@ -544,8 +576,8 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
     simulator.mark({str(k): float(v) for k, v in latest.items()})
     account = simulator.snapshot()
 
-    tradable_tickers = list(st.session_state["paper_tradable_tickers"])
-    ticker = st.selectbox("Instrument", tradable_tickers, key="paper_ticker")
+    tradable_tickers = list(st.session_state[tickers_key])
+    ticker = st.selectbox("Instrument", tradable_tickers, key=f"{key_prefix}_ticker")
     ticker_history = history[ticker].dropna()
     if len(ticker_history) < 2:
         st.warning("At least two closes are required to create an alert and simulate a later fill.")
@@ -571,16 +603,18 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
         st.warning(f"No alert available: {exc}")
 
     metric_cols = st.columns(4)
-    metric_cols[0].metric("Equity", f"${account.equity:,.2f}")
-    metric_cols[1].metric("Cash", f"${account.cash:,.2f}")
+    metric_cols[0].metric(f"Equity ({currency_code})", f"{currency_symbol}{account.equity:,.2f}")
+    metric_cols[1].metric(f"Cash ({currency_code})", f"{currency_symbol}{account.cash:,.2f}")
     metric_cols[2].metric("Positions", str(len(account.positions)))
-    metric_cols[3].metric("Latest close", f"${fill_price:,.2f}",
+    metric_cols[3].metric("Latest close", f"{currency_symbol}{fill_price:,.2f}",
                           help=f"Market data timestamp: {fill_time}")
 
-    with st.form("paper_order_form"):
-        action_name = st.selectbox("Paper order action", [a.value for a in TradeAction])
-        quantity = st.number_input("Quantity (shares)", min_value=0.001, value=1.0, step=1.0)
-        submitted = st.form_submit_button("Place paper order")
+    with st.form(f"{key_prefix}_order_form"):
+        action_name = st.selectbox("Paper order action", [a.value for a in TradeAction],
+                                   key=f"{key_prefix}_order_action")
+        quantity = st.number_input("Quantity (shares)", min_value=0.001, value=1.0, step=1.0,
+                                   key=f"{key_prefix}_order_quantity")
+        submitted = st.form_submit_button("Place paper order", key=f"{key_prefix}_submit_order")
     if submitted:
         try:
             fill = simulator.submit_order(
@@ -588,7 +622,8 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                 timestamp=fill_time.to_pydatetime(),
             )
             st.success(f"Simulated {fill.action.value} {fill.quantity:g} {fill.symbol} at "
-                       f"${fill.fill_price:,.2f}; commission ${fill.commission:,.2f}.")
+                       f"{currency_symbol}{fill.fill_price:,.2f}; commission "
+                       f"{currency_symbol}{fill.commission:,.2f}.")
             account = simulator.snapshot()
         except OrderError as exc:
             st.error(str(exc))
@@ -596,9 +631,12 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
     if account.positions:
         st.markdown("**Open paper positions**")
         st.dataframe(pd.DataFrame([{
-            "Symbol": p.symbol, "Shares": p.quantity, "Average entry": p.average_entry_price,
-            "Latest mark": p.market_price, "Market value": p.market_value,
-            "Unrealized P&L": p.unrealized_pnl, "Realized P&L": p.realized_pnl,
+            "Symbol": p.symbol, "Shares": p.quantity,
+            f"Average entry ({currency_code})": p.average_entry_price,
+            f"Latest mark ({currency_code})": p.market_price,
+            f"Market value ({currency_code})": p.market_value,
+            f"Unrealized P&L ({currency_code})": p.unrealized_pnl,
+            f"Realized P&L ({currency_code})": p.realized_pnl,
         } for p in account.positions]).set_index("Symbol"))
     if account.fills:
         traded_symbols = sorted({fill.symbol for fill in account.fills})
@@ -609,7 +647,7 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                 st.info(f"No retained price history is available for {traded_symbol}.")
                 continue
             trade_chart = paper_trade_figure(
-                history[traded_symbol], traded_symbol, account.fills
+                history[traded_symbol], traded_symbol, account.fills, currency_symbol
             )
             if trade_chart is not None:
                 st.plotly_chart(trade_chart, use_container_width=True)
@@ -622,7 +660,7 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
             "Shares": f.quantity, "Reference close": f.reference_price,
             "Fill price": f.fill_price, "Commission": f.commission,
         } for f in account.fills]).set_index("Time").sort_index(ascending=False))
-    if st.button("Reset paper account", key="reset_paper_account"):
+    if st.button("Reset paper account", key=f"{key_prefix}_reset_account"):
         del st.session_state[state_key]
         st.rerun()
 
@@ -657,15 +695,28 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Settings")
-        universe_text = st.text_area("Portfolio universe (tickers)", UNIVERSE_DEFAULT)
-        pairs_text = st.text_input("Pairs universe (tickers)", PAIRS_DEFAULT)
+        market: MarketSection = st.selectbox(
+            "Market section", MARKET_SECTIONS, format_func=lambda item: item.name,
+            key="market_section",
+        )
+        universe_text = st.text_area(
+            "Portfolio universe (tickers)", ", ".join(market.portfolio_tickers),
+            key=f"portfolio_universe_{market.key}",
+        )
+        pairs_text = st.text_input(
+            "Pairs universe (tickers)", ", ".join(market.pairs_tickers),
+            key=f"pairs_universe_{market.key}",
+        )
         start = st.date_input("History starts", dt.date(2018, 1, 1))
         formation_end = st.date_input("Formation period ends", dt.date(2024, 12, 31))
         oos_start = st.date_input("Out-of-sample starts", dt.date(2025, 1, 1))
         rf = st.number_input("Risk-free rate (annual)", 0.0, 0.15, 0.03, 0.005, format="%.3f")
         max_weight = st.slider("Max weight per asset", 0.15, 1.0, 0.40, 0.05)
         estimator = st.selectbox("Expected-return estimator", ["bayes_stein", "historical"], index=0)
-        value = st.number_input("Portfolio value ($)", 10_000.0, 1e9, 1_000_000.0, 50_000.0)
+        value = st.number_input(
+            f"Portfolio value ({market.currency_code})", 10_000.0, 1e9, 1_000_000.0,
+            50_000.0, key=f"portfolio_value_{market.key}",
+        )
         horizon = st.selectbox("VaR horizon (days)", [1, 5, 10], index=0)
         confidences = tuple(sorted(st.multiselect("Confidence levels", [0.90, 0.95, 0.975, 0.99],
                                                   default=[0.95, 0.99]))) or (0.95, 0.99)
@@ -674,6 +725,12 @@ def main() -> None:
         st.error("Dates must satisfy: history start < formation end < out-of-sample start.")
         st.stop()
     start_s, formation_s, oos_s = str(start), str(formation_end), str(oos_start)
+    st.header(f"{market.name} market section")
+    st.caption(
+        f"{market.quote_note}. Returns, risk values, and paper accounts use local quote currency "
+        f"({market.currency_code}) and are not converted to USD. The macro panel uses the platform's "
+        "shared U.S. indicators."
+    )
 
     try:
         with st.spinner("Downloading and cleaning market data..."):
@@ -712,12 +769,15 @@ def main() -> None:
         else:
             try:
                 render_risk(prices, macro if macro is not None else pd.DataFrame(), optimized, float(value),
-                            int(horizon), confidences, oos_s, start_s)
+                            int(horizon), confidences, oos_s, start_s,
+                            market.currency_code, market.currency_symbol)
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Risk analysis failed: {exc}")
     with tabs[4]:
         try:
-            render_paper_trading(prices, start_s)
+            render_paper_trading(
+                prices, start_s, market.key, market.currency_code, market.currency_symbol
+            )
         except Exception as exc:  # noqa: BLE001 - isolate optional research UI failures
             st.error(f"Paper trading research tool failed: {exc}")
 

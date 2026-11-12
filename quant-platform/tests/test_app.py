@@ -262,11 +262,11 @@ class UiWiringTests(unittest.TestCase):
             app = import_app(st)
             with mock.patch.object(app, "load_prices", return_value=selected):
                 app.render_paper_trading(prices, "2024-01-02")
-        account = st.session_state["paper_trading_simulator"].snapshot()
+        account = st.session_state["paper_default_simulator"].snapshot()
         self.assertEqual(len(account.fills), 1)
         self.assertEqual(account.fills[0].action.value, "BUY")
         self.assertEqual(account.fills[0].symbol, "AAPL")
-        self.assertEqual(st.session_state["paper_tradable_tickers"], ["AAPL", "MSFT"])
+        self.assertEqual(st.session_state["paper_default_tradable_tickers"], ["AAPL", "MSFT"])
         self.assertGreaterEqual(st.calls.count("plotly_chart"), 1)
 
         st.overrides.update({"Place paper order": False, "Add stocks to account": True,
@@ -278,7 +278,23 @@ class UiWiringTests(unittest.TestCase):
             app.render_paper_trading(prices, "2024-01-02")
         fetch_prices.assert_called_once_with(("AAPL", "MSFT", "NVDA"), "2024-01-02")
         self.assertEqual(
-            st.session_state["paper_tradable_tickers"], ["AAPL", "MSFT", "NVDA"]
+            st.session_state["paper_default_tradable_tickers"], ["AAPL", "MSFT", "NVDA"]
+        )
+
+    def test_each_market_has_an_independent_paper_account(self) -> None:
+        st = FakeStreamlit({"Start paper account": True})
+        prices = pd.DataFrame(
+            {"TEST": np.linspace(100.0, 150.0, 260)},
+            index=pd.bdate_range("2024-01-02", periods=260),
+        )
+        with mock.patch.dict(sys.modules, fake_modules(st)):
+            app = import_app(st)
+            app.render_paper_trading(prices, "2024-01-02", "us", "USD", "$")
+            app.render_paper_trading(prices, "2024-01-02", "japan", "JPY", "¥")
+        self.assertIn("paper_us_simulator", st.session_state)
+        self.assertIn("paper_japan_simulator", st.session_state)
+        self.assertIsNot(
+            st.session_state["paper_us_simulator"], st.session_state["paper_japan_simulator"]
         )
 
     def test_invalid_dates_stop_with_message(self) -> None:

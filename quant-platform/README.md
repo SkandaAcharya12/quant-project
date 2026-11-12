@@ -8,8 +8,9 @@ Research engines, a paper simulator, and a dashboard:
 | `backtester/` | Cointegration-gated pairs trading: rolling Engle-Granger test, Z-score signals, delayed fills, costs |
 | `optimizer/` | Mean-variance optimization with Ledoit-Wolf / Bayes-Stein shrinkage, efficient frontier, 10,000-run Monte Carlo, walk-forward test |
 | `risk_engine/` | Historical / parametric / Cornish-Fisher / filtered-historical VaR and ES, drawdowns, Kupiec and Christoffersen backtests, stress tests |
+| `market_engine/` | Typed market sections, exchange universes, and local quote-currency metadata |
 | `paper_trading/` | Manual paper orders with an auditable cash/position ledger, explicit costs, and leakage-aware machine-learning alerts |
-| `app.py` | Streamlit dashboard over all four engines |
+| `app.py` | Streamlit dashboard with region-scoped tabs over the research engines and paper simulator |
 
 Everything is chosen or estimated on a **formation period** (default through 2024-12-31) and judged on a later
 **out-of-sample period** (default from 2025-01-01).
@@ -84,4 +85,8 @@ The **Paper trading** tab lets users enter a comma-separated stock universe when
 The alert model is an expanding-history logistic classifier. It uses trailing momentum, realized volatility, and moving-average spread features to estimate next-bar return direction. Its probabilities are sigmoid-calibrated with forward-only time splits. At decision time *t*, training labels come only from feature rows before *t*, so each included next-bar return is observable by *t*. Actionable alerts require at least 90% model confidence; lower-confidence cases are shown as HOLD. Calibration does not guarantee future accuracy, and this threshold can mean most observations produce no actionable alert. The dashboard shows an alert based on the penultimate available close and simulates a fill at the latest close, avoiding same-bar signal/fill look-ahead.
 
 This is an educational simulation, not a broker connection or trading recommendation. Close-price fills cannot represent order-book depth, intraday paths, financing, borrow availability, halts, or taxes. Short-sale proceeds, buying power, and margin calls are simplified; commissions and slippage are configurable in the engine and use illustrative defaults. Calibrated probabilities are estimates, not guarantees of future accuracy. Evaluate any strategy with a separate walk-forward design and realistic costs before drawing conclusions.
+
+## Regional market sections
+
+Use **Market section** in the sidebar to switch between the United States, United Kingdom, Eurozone, Japan, India, and Canada. Each section has its own editable portfolio and pairs universes, plus the same market data, pairs, optimizer, risk, and paper-trading tabs. Paper balances and watchlists are isolated by market. Foreign-market prices, risk values, and paper accounts remain in local quote currency (including GBp for London listings); they are not converted to USD. The macro dashboard is shared and currently uses U.S. indicators, so foreign-market macro context is not region-specific.
 
