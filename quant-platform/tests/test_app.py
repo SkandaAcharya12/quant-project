@@ -163,13 +163,24 @@ class _Trace:
 
 
 class FakeFigure:
-    def __init__(self, *_a: object, **_k: object) -> None:
+    def __init__(self, *_a: object, **kwargs: object) -> None:
         self.ops: list[str] = []
         self.traces: list[_Trace] = []
+        self.layout_updates: list[dict[str, object]] = []
+        self.subplot_options = kwargs
+        self.vline_options: list[dict[str, object]] = []
 
     def add_trace(self, trace: _Trace, *_a: object, **_k: object) -> None:
         self.ops.append("add_trace")
         self.traces.append(trace)
+
+    def update_layout(self, **kwargs: object) -> None:
+        self.ops.append("update_layout")
+        self.layout_updates.append(kwargs)
+
+    def add_vline(self, *_a: object, **kwargs: object) -> None:
+        self.ops.append("add_vline")
+        self.vline_options.append(kwargs)
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         if name.startswith("__"):
@@ -189,7 +200,7 @@ class FakeGO(types.ModuleType):
 
 def fake_modules(st: FakeStreamlit) -> dict[str, types.ModuleType]:
     subplots = types.ModuleType("plotly.subplots")
-    subplots.make_subplots = lambda *a, **k: FakeFigure()  # type: ignore[attr-defined]
+    subplots.make_subplots = lambda *a, **k: FakeFigure(**k)  # type: ignore[attr-defined]
     plotly = types.ModuleType("plotly")
     go = FakeGO()
     plotly.graph_objects, plotly.subplots = go, subplots  # type: ignore[attr-defined]
@@ -272,6 +283,10 @@ class ComputationLayerTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(figure)
+        self.assertEqual(figure.layout_updates[-1]["hovermode"], "closest")
+        self.assertFalse(figure.layout_updates[-1]["showlegend"])
+        self.assertNotIn("subplot_titles", figure.subplot_options)
+        self.assertTrue(all("annotation_text" not in line for line in figure.vline_options))
         candles = [trace for trace in figure.traces if "open" in trace.kw]
         self.assertEqual(len(candles), 1)
         self.assertEqual(list(candles[0].kw["close"]), list(ohlcv["Close"].tail(180)))
