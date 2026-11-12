@@ -267,6 +267,7 @@ class UiWiringTests(unittest.TestCase):
         self.assertEqual(account.fills[0].action.value, "BUY")
         self.assertEqual(account.fills[0].symbol, "AAPL")
         self.assertEqual(st.session_state["paper_tradable_tickers"], ["AAPL", "MSFT"])
+        self.assertGreaterEqual(st.calls.count("plotly_chart"), 1)
 
         st.overrides.update({"Place paper order": False, "Add stocks to account": True,
                              "New ticker symbol(s)": "NVDA"})

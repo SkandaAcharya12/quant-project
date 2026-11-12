@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover
 from backtester import BacktestResult, PairsBacktestConfig, PairsBacktester, screen_pairs
 from data_engine import DataEngine, DataEngineConfig, DataEngineError
 from optimizer import OptimizationResult, OptimizerConfig, PortfolioOptimizer, WalkForwardResult
-from paper_trading import AgentError, OrderError, PaperSimulator, ResearchAgent, TradeAction
+from paper_trading import AgentError, Fill, OrderError, PaperSimulator, ResearchAgent, TradeAction
 from risk_engine import (
     RiskConfig,
     RiskEngine,
@@ -409,6 +409,51 @@ def render_risk(
         st.dataframe(report.factor_stress[["portfolio_return", "pnl_usd"]].round(4))
 
 
+def paper_trade_figure(prices: pd.Series, symbol: str, fills: tuple[Fill, ...]) -> Any | None:
+    """Plot close history and every simulated fill for one symbol."""
+    history = pd.to_numeric(prices, errors="coerce").dropna().sort_index()
+    if go is None or history.empty:
+        return None
+
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(
+        x=history.index, y=history.to_numpy(), mode="lines", name="Close",
+        line={"color": "#4C78A8", "width": 2},
+    ))
+    symbol_fills = [fill for fill in fills if fill.symbol == symbol]
+    if symbol_fills:
+        colors = {"BUY": "#16803C", "COVER": "#2A9D8F", "SELL": "#E09F3E", "SHORT": "#C44536"}
+        markers = {"BUY": "triangle-up", "COVER": "circle", "SELL": "triangle-down", "SHORT": "triangle-down"}
+        figure.add_trace(go.Scatter(
+            x=[fill.timestamp for fill in symbol_fills],
+            y=[fill.fill_price for fill in symbol_fills],
+            mode="markers",
+            name="Paper trades",
+            marker={
+                "size": 12,
+                "color": [colors[fill.action.value] for fill in symbol_fills],
+                "symbol": [markers[fill.action.value] for fill in symbol_fills],
+                "line": {"color": "white", "width": 1},
+            },
+            text=[f"{fill.action.value} {fill.quantity:g} shares" for fill in symbol_fills],
+            customdata=[[fill.reference_price, fill.commission] for fill in symbol_fills],
+            hovertemplate=(
+                "%{text}<br>%{x}<br>Fill: $%{y:.2f}"
+                "<br>Reference: $%{customdata[0]:.2f}"
+                "<br>Commission: $%{customdata[1]:.2f}<extra></extra>"
+            ),
+        ))
+    figure.update_layout(
+        title=f"{symbol} close price and paper trades",
+        xaxis_title="Date",
+        yaxis_title="Price ($)",
+        template=TEMPLATE,
+        hovermode="closest",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
+    )
+    return figure
+
+
 def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) -> None:
     """Render a user-controlled paper ledger, watchlist, and advisory ML alert."""
     st.subheader("Paper trading simulator")
@@ -464,6 +509,14 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                 combined = tuple(current_tickers + additions)
                 try:
                     updated_prices = _load_paper_prices(prices, combined, data_start)
+                    old_history = st.session_state["paper_market_data"]
+                    archived = [
+                        ticker for ticker in old_history.columns if str(ticker).upper() not in combined
+                    ]
+                    if archived:
+                        updated_prices = pd.concat(
+                            [old_history.loc[:, archived], updated_prices], axis=1
+                        ).sort_index()
                     st.session_state["paper_market_data"] = updated_prices
                     st.session_state["paper_tradable_tickers"] = list(combined)
                 except (DataEngineError, ValueError, RuntimeError) as exc:
@@ -481,9 +534,6 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
                 st.error("Keep at least one ticker in the account.")
             else:
                 remaining = [ticker for ticker in current_tickers if ticker != remove_ticker]
-                st.session_state["paper_market_data"] = st.session_state[
-                    "paper_market_data"
-                ].drop(columns=[remove_ticker])
                 st.session_state["paper_tradable_tickers"] = remaining
 
     history = st.session_state["paper_market_data"].dropna(how="all").sort_index()
@@ -494,7 +544,8 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
     simulator.mark({str(k): float(v) for k, v in latest.items()})
     account = simulator.snapshot()
 
-    ticker = st.selectbox("Instrument", list(latest.index), key="paper_ticker")
+    tradable_tickers = list(st.session_state["paper_tradable_tickers"])
+    ticker = st.selectbox("Instrument", tradable_tickers, key="paper_ticker")
     ticker_history = history[ticker].dropna()
     if len(ticker_history) < 2:
         st.warning("At least two closes are required to create an alert and simulate a later fill.")
@@ -547,6 +598,21 @@ def render_paper_trading(prices: pd.DataFrame, start_date: str | None = None) ->
             "Unrealized P&L": p.unrealized_pnl, "Realized P&L": p.realized_pnl,
         } for p in account.positions]).set_index("Symbol"))
     if account.fills:
+        traded_symbols = sorted({fill.symbol for fill in account.fills})
+        st.markdown("**Stock price charts with paper trades**")
+        for traded_symbol in traded_symbols:
+            st.markdown(f"**{traded_symbol}**")
+            if traded_symbol not in history.columns:
+                st.info(f"No retained price history is available for {traded_symbol}.")
+                continue
+            trade_chart = paper_trade_figure(
+                history[traded_symbol], traded_symbol, account.fills
+            )
+            if trade_chart is not None:
+                st.plotly_chart(trade_chart, use_container_width=True)
+            else:
+                st.line_chart(history[traded_symbol], use_container_width=True)
+
         st.markdown("**Order audit log**")
         st.dataframe(pd.DataFrame([{
             "Time": f.timestamp, "Symbol": f.symbol, "Action": f.action.value,
