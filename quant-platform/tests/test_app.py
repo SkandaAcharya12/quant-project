@@ -237,9 +237,9 @@ class UiWiringTests(unittest.TestCase):
         st = self._run()
         self.assertEqual(st.errors, [], st.errors)
         self.assertEqual(st.warnings, [], st.warnings)
-        # market data 2, pairs 1, optimizer 3, risk 5 -- a dropped chart or table is a regression
+        # Eleven charts should render; an empty pair-trade log is intentionally not a table.
         self.assertEqual(st.calls.count("plotly_chart"), 11)
-        self.assertEqual(st.calls.count("dataframe"), 10)
+        self.assertEqual(st.calls.count("dataframe"), 9)
         self.assertIn("title", st.calls)
         self.assertIn("Paper trading", st.tab_labels)
 

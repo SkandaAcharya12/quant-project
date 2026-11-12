@@ -17,6 +17,7 @@ later OUT-OF-SAMPLE period (default: 2025 onward). All heavy computation lives i
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import logging
 from collections.abc import Callable, Iterable
 from typing import Any, cast
@@ -210,98 +211,428 @@ def _need_plotly() -> None:
         raise RuntimeError("plotly is required: pip install -r requirements.txt")
 
 
+def _wide_widget_kwargs(widget: Any) -> dict[str, Any]:
+    """Use the installed Streamlit width API while supporting the older app minimum."""
+    try:
+        supports_width = "width" in inspect.signature(widget).parameters
+    except (TypeError, ValueError):
+        supports_width = False
+    return {"width": "stretch"} if supports_width else {"use_container_width": True}
+
+
+def _display_chart(figure: Any) -> None:
+    """Render Plotly figures consistently at the available content width."""
+    st.plotly_chart(figure, theme=None, **_wide_widget_kwargs(st.plotly_chart))
+
+
+def _pretty_column_name(name: object) -> str:
+    """Turn engine-style column names into readable table headings."""
+    aliases = {
+        "adf": "ADF",
+        "es": "ES",
+        "ewma": "EWMA",
+        "fhs": "FHS",
+        "gmv": "GMV",
+        "oos": "OOS",
+        "pnl": "P&L",
+        "pvalue": "p-value",
+        "usd": "USD",
+        "var": "VaR",
+    }
+    words = str(name).replace("_", " ").split()
+    return " ".join(aliases.get(word.lower(), word.capitalize()) for word in words)
+
+
+def _display_table(
+    frame: pd.DataFrame,
+    *,
+    index_name: str | None = None,
+    percent_columns: tuple[str, ...] = (),
+    integer_columns: tuple[str, ...] = (),
+    number_formats: dict[str, str] | None = None,
+    currency_columns: tuple[str, ...] = (),
+    currency_symbol: str = "$",
+    column_labels: dict[str, str] | None = None,
+    height: int | None = None,
+    hide_index: bool | None = None,
+) -> None:
+    """Show a full-width table with consistent labels and numeric precision.
+
+    Formatting is applied only to the display configuration. The underlying
+    numeric values stay numeric, so sorting and CSV export remain useful.
+    """
+    labels = {column: _pretty_column_name(column) for column in frame.columns}
+    if column_labels:
+        labels.update(column_labels)
+    display = frame.rename(columns=labels).copy()
+    if index_name is not None and not isinstance(display.index, pd.MultiIndex):
+        display.index.name = index_name
+    should_hide_index = (
+        isinstance(display.index, pd.RangeIndex) and display.index.name is None
+        if hide_index is None
+        else hide_index
+    )
+
+    column_config: dict[str, Any] = {}
+    config_api = getattr(st, "column_config", None)
+    number_column = getattr(config_api, "NumberColumn", None)
+    date_column = getattr(config_api, "DatetimeColumn", None)
+    if callable(number_column):
+        for source_name in percent_columns:
+            label = labels.get(source_name, source_name)
+            column_config[label] = number_column(label, format="percent")
+        for source_name in integer_columns:
+            label = labels.get(source_name, source_name)
+            column_config[label] = number_column(label, format="%,d")
+        for source_name in currency_columns:
+            label = labels.get(source_name, source_name)
+            column_config[label] = number_column(label, format=f"{currency_symbol}%,.2f")
+        for source_name, number_format in (number_formats or {}).items():
+            label = labels.get(source_name, source_name)
+            column_config[label] = number_column(label, format=number_format)
+    if callable(date_column):
+        for column_name, series in display.items():
+            if pd.api.types.is_datetime64_any_dtype(series):
+                label = str(column_name)
+                column_config[label] = date_column(label, format="YYYY-MM-DD HH:mm")
+
+    kwargs: dict[str, Any] = {
+        **_wide_widget_kwargs(st.dataframe),
+        "hide_index": should_hide_index,
+        "column_config": column_config or None,
+    }
+    if height is not None:
+        kwargs["height"] = height
+    st.dataframe(display, **kwargs)
+
+
+def _polish_figure(
+    figure: Any,
+    *,
+    title: str | None = None,
+    height: int | None = None,
+    hovermode: str = "x unified",
+    show_legend: bool | None = None,
+) -> Any:
+    """Apply one visual system to charts while keeping each plot's data intact."""
+    layout: dict[str, Any] = {
+        "template": TEMPLATE,
+        "font": {"family": "Inter, Segoe UI, Arial, sans-serif", "size": 12, "color": "#243447"},
+        "paper_bgcolor": "#FFFFFF",
+        "plot_bgcolor": "#FFFFFF",
+        "colorway": ["#2563EB", "#0F766E", "#7C3AED", "#D97706", "#DC2626", "#0891B2"],
+        "margin": {"l": 68, "r": 26, "t": 82, "b": 58},
+        "hovermode": hovermode,
+        "legend": {
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "x": 0,
+            "bgcolor": "rgba(255,255,255,0.85)",
+            "font": {"size": 11},
+        },
+    }
+    if title is not None:
+        layout["title"] = {
+            "text": title,
+            "x": 0.01,
+            "xanchor": "left",
+            "font": {"size": 18, "color": "#172B4D"},
+        }
+    if height is not None:
+        layout["height"] = height
+    if show_legend is not None:
+        layout["showlegend"] = show_legend
+    figure.update_layout(**layout)
+    figure.update_xaxes(showline=True, linecolor="#CBD5E1", showgrid=False, zeroline=False,
+                        ticks="outside", automargin=True)
+    figure.update_yaxes(showline=False, showgrid=True, gridcolor="#E7EDF3", zeroline=False,
+                        ticks="outside", automargin=True)
+    layout_object = getattr(figure, "layout", None)
+    if getattr(layout_object, "annotations", None):
+        figure.update_annotations(font={"size": 12, "color": "#334155"})
+    return figure
+
+
 def _oos_marker(fig: Any, oos_start: str | None) -> None:
     if oos_start:
         fig.add_shape(type="line", x0=oos_start, x1=oos_start, y0=0, y1=1, yref="paper",
-                      line={"dash": "dash", "color": "darkorange"})
+                      line={"dash": "dash", "color": "#D97706", "width": 1.5})
+        fig.add_annotation(
+            x=oos_start,
+            y=1,
+            yref="paper",
+            text="OOS start",
+            showarrow=False,
+            xanchor="left",
+            yshift=10,
+            font={"size": 10, "color": "#B45309"},
+            bgcolor="rgba(255,255,255,0.85)",
+        )
 
 
 def fig_prices(prices: pd.DataFrame, oos_start: str | None = None) -> Any:
     _need_plotly()
     rebased = prices / prices.iloc[0] * 100.0
-    fig = go.Figure([go.Scatter(x=rebased.index, y=rebased[c], name=c, mode="lines") for c in rebased])
+    fig = go.Figure([
+        go.Scatter(
+            x=rebased.index,
+            y=rebased[c],
+            name=str(c),
+            mode="lines",
+            line={"width": 2},
+            hovertemplate="%{x|%b %d, %Y}<br>Index: %{y:.1f}<extra>%{fullData.name}</extra>",
+        )
+        for c in rebased
+    ])
     _oos_marker(fig, oos_start)
-    fig.update_layout(title="Price history (rebased to 100; dashed line = out-of-sample start)",
-                      template=TEMPLATE, height=420, yaxis_title="Rebased price")
-    return fig
+    fig.update_yaxes(title_text="Growth of 100", tickformat=".0f")
+    fig.update_xaxes(title_text="Date")
+    show_legend = len(rebased.columns) <= 12
+    title = "Price performance · rebased to 100"
+    if not show_legend:
+        title += " · hover for ticker names"
+    return _polish_figure(
+        fig,
+        title=title,
+        height=430,
+        hovermode="x unified" if show_legend else "closest",
+        show_legend=show_legend,
+    )
 
 
 def fig_macro(macro: pd.DataFrame) -> Any:
     _need_plotly()
-    panels = [(c, t) for c, t in (("vix", "VIX"), ("yield_curve_10y3m", "10Y minus 3M yield (pp)"),
-                                  ("gold", "Gold"), ("wti_crude", "WTI crude")) if c in macro.columns]
-    fig = make_subplots(rows=max(len(panels), 1), cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                        subplot_titles=[t for _, t in panels])
-    for i, (col, _) in enumerate(panels, start=1):
-        fig.add_trace(go.Scatter(x=macro.index, y=macro[col], name=col, mode="lines"), row=i, col=1)
+    panels = [
+        ("vix", "Volatility index", "Index points"),
+        ("yield_curve_10y3m", "10Y–3M Treasury spread", "Percentage points"),
+        ("gold", "Gold", "USD per troy ounce"),
+        ("wti_crude", "WTI crude oil", "USD per barrel"),
+    ]
+    panels = [(col, title, unit) for col, title, unit in panels if col in macro.columns]
+    if not panels:
+        return _polish_figure(go.Figure(), title="Macro regime indicators", height=320)
+    fig = make_subplots(
+        rows=len(panels),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=[title for _, title, _ in panels],
+    )
+    for row, (col, _, unit) in enumerate(panels, start=1):
+        fig.add_trace(
+            go.Scatter(
+                x=macro.index,
+                y=macro[col],
+                name=col,
+                mode="lines",
+                line={"width": 1.8},
+                hovertemplate="%{x|%b %d, %Y}<br>%{y:,.2f}<extra></extra>",
+            ),
+            row=row,
+            col=1,
+        )
+        fig.update_yaxes(title_text=unit, row=row, col=1)
     if "yield_curve_10y3m" in macro.columns:
-        row = [c for c, _ in panels].index("yield_curve_10y3m") + 1
-        fig.add_hline(y=0.0, line_dash="dot", line_color="crimson", row=row, col=1)  # inversion line
-    fig.update_layout(template=TEMPLATE, height=240 * max(len(panels), 1), showlegend=False,
-                      title="Macro regime indicators")
-    return fig
+        row = [col for col, _, _ in panels].index("yield_curve_10y3m") + 1
+        fig.add_hline(y=0.0, line_dash="dot", line_color="#DC2626", row=row, col=1)
+    fig.update_xaxes(title_text="Date", row=len(panels), col=1)
+    return _polish_figure(
+        fig,
+        title="Macro regime indicators",
+        height=max(330, 205 * len(panels) + 90),
+        show_legend=False,
+    )
 
 
 def fig_pairs(result: BacktestResult, cfg_entry: float, cfg_exit: float, oos_start: str | None) -> Any:
     _need_plotly()
     f = result.frame
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        row_heights=[0.4, 0.35, 0.25],
-                        subplot_titles=("Spread Z-score", "Equity", "Drawdown"))
-    fig.add_trace(go.Scatter(x=f.index, y=f["zscore"], name="Z-score", mode="lines"), row=1, col=1)
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        row_heights=[0.4, 0.35, 0.25],
+        subplot_titles=("Spread z-score", "Strategy equity", "Drawdown"),
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=f.index,
+            y=f["zscore"],
+            name="Spread z-score",
+            mode="lines",
+            line={"color": "#2563EB", "width": 1.8},
+            hovertemplate="%{x|%b %d, %Y}<br>Z-score: %{y:.2f}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
     for level in (cfg_entry, -cfg_entry):
-        fig.add_hline(y=level, line_dash="dash", line_color="crimson", row=1, col=1)
+        fig.add_hline(y=level, line_dash="dash", line_color="#DC2626", row=1, col=1)
     for level in (cfg_exit, -cfg_exit):
-        fig.add_hline(y=level, line_dash="dot", line_color="gray", row=1, col=1)
+        fig.add_hline(y=level, line_dash="dot", line_color="#94A3B8", row=1, col=1)
     held = f[f["position"] != 0]
-    fig.add_trace(go.Scatter(x=held.index, y=held["zscore"], mode="markers", name="In position",
-                             marker={"size": 4, "color": "royalblue"}), row=1, col=1)
-    fig.add_trace(go.Scatter(x=f.index, y=f["equity"], name="Equity", mode="lines"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=f.index, y=f["drawdown"], name="Drawdown", fill="tozeroy"), row=3, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=held.index,
+            y=held["zscore"],
+            mode="markers",
+            name="In position",
+            marker={"size": 5, "color": "#0F766E"},
+            hovertemplate="%{x|%b %d, %Y}<br>Position z-score: %{y:.2f}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=f.index,
+            y=f["equity"],
+            name="Equity",
+            mode="lines",
+            line={"color": "#0F766E", "width": 1.8},
+            hovertemplate="%{x|%b %d, %Y}<br>Equity: %{y:.3f}<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=f.index,
+            y=f["drawdown"],
+            name="Drawdown",
+            fill="tozeroy",
+            line={"color": "#DC2626", "width": 1.2},
+            hovertemplate="%{x|%b %d, %Y}<br>Drawdown: %{y:.2%}<extra></extra>",
+        ),
+        row=3,
+        col=1,
+    )
     _oos_marker(fig, oos_start)
-    fig.update_layout(template=TEMPLATE, height=760, showlegend=False,
-                      title=f"Pairs trade: long/short {result.pair[0]} vs {result.pair[1]}")
-    return fig
+    fig.update_yaxes(title_text="Z-score", row=1, col=1)
+    fig.update_yaxes(title_text="Growth of 1", row=2, col=1, tickformat=".2f")
+    fig.update_yaxes(title_text="Drawdown", row=3, col=1, tickformat=".0%")
+    fig.update_xaxes(title_text="Date", row=3, col=1)
+    return _polish_figure(
+        fig,
+        title=f"Pairs strategy · {result.pair[0]} / {result.pair[1]}",
+        height=760,
+        show_legend=False,
+    )
 
 
 def fig_weights(result: OptimizationResult) -> Any:
     _need_plotly()
     fig = go.Figure()
-    for p in (result.max_sharpe, result.gmv, result.equal_weight):
-        fig.add_trace(go.Bar(x=list(p.weights.index), y=p.weights.to_numpy(), name=p.label))
-    fig.update_layout(template=TEMPLATE, barmode="group", title="Portfolio weights", yaxis_tickformat=".0%")
-    return fig
+    portfolios = (result.max_sharpe, result.gmv, result.equal_weight)
+    weights = pd.concat(
+        [portfolio.weights.rename(portfolio.label) for portfolio in portfolios], axis=1
+    ).fillna(0.0)
+    ranked_assets = weights.abs().max(axis=1).nlargest(20).index
+    omitted_assets = weights.index.difference(ranked_assets)
+    for p in portfolios:
+        selected_weights = p.weights.reindex(ranked_assets, fill_value=0.0)
+        labels = [str(asset) for asset in selected_weights.index]
+        values = selected_weights.to_numpy().tolist()
+        if len(omitted_assets):
+            labels.append("Other")
+            values.append(float(p.weights.reindex(omitted_assets, fill_value=0.0).sum()))
+        fig.add_trace(
+            go.Bar(
+                x=labels,
+                y=values,
+                name=p.label,
+                hovertemplate="%{x}<br>Weight: %{y:.1%}<extra>%{fullData.name}</extra>",
+            )
+        )
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title_text="Portfolio weight", tickformat=".0%")
+    fig.update_xaxes(title_text="Asset", tickangle=-35)
+    title = "Portfolio weights"
+    if len(omitted_assets):
+        title = "Portfolio weights · top 20 assets and remainder"
+    return _polish_figure(fig, title=title, height=430)
 
 
 def fig_walk_forward(wf: WalkForwardResult, oos_start: str) -> Any:
     _need_plotly()
     growth = (1.0 + wf.returns.loc[oos_start:]).cumprod()
-    fig = go.Figure([go.Scatter(x=growth.index, y=growth[c], name=c, mode="lines") for c in growth])
-    fig.update_layout(template=TEMPLATE, title="Walk-forward growth of one unit (out-of-sample, after costs)")
-    return fig
+    fig = go.Figure([
+        go.Scatter(
+            x=growth.index,
+            y=growth[c],
+            name=str(c),
+            mode="lines",
+            line={"width": 2},
+            hovertemplate="%{x|%b %d, %Y}<br>Growth: %{y:.3f}<extra>%{fullData.name}</extra>",
+        )
+        for c in growth
+    ])
+    fig.update_yaxes(title_text="Value of one starting unit", tickformat=".2f")
+    fig.update_xaxes(title_text="Date")
+    return _polish_figure(
+        fig,
+        title="Walk-forward performance · out-of-sample, after costs",
+        height=430,
+    )
 
 
 def fig_return_distribution(report: RiskReport, alpha: float) -> Any:
     _need_plotly()
     r = report.returns.to_numpy()
-    fig = go.Figure(go.Histogram(x=r, nbinsx=80, name="Daily returns", marker_color="lightsteelblue"))
+    fig = go.Figure(go.Histogram(
+        x=r,
+        nbinsx=60,
+        name="Daily returns",
+        marker={"color": "#93C5FD", "line": {"color": "#FFFFFF", "width": 1}},
+        hovertemplate="Daily return: %{x:.2%}<br>Observations: %{y}<extra></extra>",
+    ))
     table = report.var_table
-    for method, color in (("Historical", "crimson"), ("Parametric (normal)", "darkgreen"),
-                          ("Filtered historical (EWMA)", "purple")):
+    thresholds = 0
+    for method, color in (("Historical", "#DC2626"), ("Parametric (normal)", "#0F766E"),
+                          ("Filtered historical (EWMA)", "#7C3AED")):
         if (method, alpha) in table.index:
-            fig.add_vline(x=-float(table.loc[(method, alpha), "var"]), line_color=color, line_dash="dash",
-                          annotation_text=f"{method} VaR", annotation_position="top")
-    fig.update_layout(template=TEMPLATE, title=f"Return distribution with {alpha:.0%} VaR (1-day horizon scale)",
-                      xaxis_tickformat=".1%")
-    return fig
+            threshold = -float(table.loc[(method, alpha), "var"])
+            fig.add_vline(x=threshold, line_color=color, line_dash="dash", line_width=1.5)
+            fig.add_annotation(
+                x=threshold,
+                y=0.97 - 0.11 * thresholds,
+                xref="x",
+                yref="paper",
+                text=f"{method} VaR",
+                showarrow=False,
+                xanchor="left",
+                font={"size": 10, "color": color},
+                bgcolor="rgba(255,255,255,0.85)",
+            )
+            thresholds += 1
+    fig.update_xaxes(title_text="Daily return", tickformat=".1%")
+    fig.update_yaxes(title_text="Trading days")
+    return _polish_figure(
+        fig,
+        title=f"Daily return distribution · {alpha:.0%} VaR thresholds",
+        height=420,
+        hovermode="closest",
+        show_legend=False,
+    )
 
 
 def fig_drawdown(report: RiskReport) -> Any:
     _need_plotly()
     dd = report.drawdown.series["drawdown"]
-    fig = go.Figure(go.Scatter(x=dd.index, y=dd, fill="tozeroy", name="Drawdown", line={"color": "crimson"}))
-    fig.update_layout(template=TEMPLATE, title="Underwater curve", yaxis_tickformat=".0%")
-    return fig
+    fig = go.Figure(go.Scatter(
+        x=dd.index,
+        y=dd,
+        fill="tozeroy",
+        name="Drawdown",
+        line={"color": "#DC2626", "width": 1.8},
+        fillcolor="rgba(220,38,38,0.12)",
+        hovertemplate="%{x|%b %d, %Y}<br>Drawdown: %{y:.2%}<extra></extra>",
+    ))
+    fig.update_yaxes(title_text="Drawdown from prior peak", tickformat=".0%")
+    fig.update_xaxes(title_text="Date")
+    return _polish_figure(fig, title="Portfolio drawdown", height=410, show_legend=False)
 
 
 def fig_var_backtest(bt: pd.DataFrame, title: str) -> Any:
@@ -309,24 +640,64 @@ def fig_var_backtest(bt: pd.DataFrame, title: str) -> Any:
     valid = bt.dropna(subset=["var"])
     hits = valid[valid["exception"]]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=valid.index, y=valid["return"], mode="lines", name="Return",
-                             line={"color": "lightgray"}))
-    fig.add_trace(go.Scatter(x=valid.index, y=-valid["var"], mode="lines", name="-VaR forecast",
-                             line={"color": "royalblue"}))
-    fig.add_trace(go.Scatter(x=hits.index, y=hits["return"], mode="markers", name="Exception",
-                             marker={"color": "crimson", "size": 7}))
-    fig.update_layout(template=TEMPLATE, title=title, yaxis_tickformat=".1%")
-    return fig
+    fig.add_trace(go.Scatter(
+        x=valid.index,
+        y=valid["return"],
+        mode="lines",
+        name="Realized return",
+        line={"color": "#94A3B8", "width": 1.2},
+        hovertemplate="%{x|%b %d, %Y}<br>Realized return: %{y:.2%}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=valid.index,
+        y=-valid["var"],
+        mode="lines",
+        name="VaR limit",
+        line={"color": "#2563EB", "width": 1.8},
+        hovertemplate="%{x|%b %d, %Y}<br>VaR limit: %{y:.2%}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=hits.index,
+        y=hits["return"],
+        mode="markers",
+        name="VaR exception",
+        marker={"color": "#DC2626", "size": 8, "line": {"color": "#FFFFFF", "width": 1}},
+        hovertemplate="%{x|%b %d, %Y}<br>Exception return: %{y:.2%}<extra></extra>",
+    ))
+    fig.update_yaxes(title_text="Daily return", tickformat=".1%")
+    fig.update_xaxes(title_text="Date")
+    return _polish_figure(fig, title=title, height=430)
 
 
 def fig_contributions(report: RiskReport) -> Any:
     _need_plotly()
     c = report.contributions
-    fig = go.Figure([go.Bar(x=c.index, y=c["pct_of_risk"], name="Share of risk"),
-                     go.Bar(x=c.index, y=c["weight"], name="Weight")])
-    fig.update_layout(template=TEMPLATE, barmode="group", title="Weight vs. share of portfolio risk",
-                      yaxis_tickformat=".0%")
-    return fig
+    ranked_assets = c["pct_of_risk"].abs().nlargest(20).index
+    omitted_assets = c.index.difference(ranked_assets)
+    display = c.loc[ranked_assets, ["pct_of_risk", "weight"]].copy()
+    if len(omitted_assets):
+        display.loc["Other"] = c.loc[omitted_assets, ["pct_of_risk", "weight"]].sum()
+    fig = go.Figure([
+        go.Bar(
+            x=display.index,
+            y=display["pct_of_risk"],
+            name="Share of risk",
+            hovertemplate="%{x}<br>Risk contribution: %{y:.1%}<extra></extra>",
+        ),
+        go.Bar(
+            x=display.index,
+            y=display["weight"],
+            name="Portfolio weight",
+            hovertemplate="%{x}<br>Weight: %{y:.1%}<extra></extra>",
+        ),
+    ])
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title_text="Share", tickformat=".0%")
+    fig.update_xaxes(title_text="Asset", tickangle=-35)
+    title = "Portfolio risk contribution vs. weight"
+    if len(omitted_assets):
+        title = "Portfolio risk contribution · top 20 assets and remainder"
+    return _polish_figure(fig, title=title, height=430)
 
 
 def fig_stress(report: RiskReport) -> Any:
@@ -335,11 +706,26 @@ def fig_stress(report: RiskReport) -> Any:
     if report.factor_stress is not None and not report.factor_stress.empty:
         parts.append(report.factor_stress["portfolio_return"])
     s = pd.concat(parts).sort_values()
-    fig = go.Figure(go.Bar(x=s.to_numpy(), y=list(s.index), orientation="h",
-                           marker_color=["crimson" if v < 0 else "seagreen" for v in s]))
-    fig.update_layout(template=TEMPLATE, title="Portfolio return under stress scenarios",
-                      xaxis_tickformat=".0%", height=max(300, 60 * len(s)))
-    return fig
+    fig = go.Figure(go.Bar(
+        x=s.to_numpy(),
+        y=[str(label) for label in s.index],
+        orientation="h",
+        marker={
+            "color": ["#DC2626" if value < 0 else "#0F766E" for value in s],
+            "line": {"color": "#FFFFFF", "width": 1},
+        },
+        hovertemplate="%{y}<br>Portfolio return: %{x:.2%}<extra></extra>",
+    ))
+    fig.update_xaxes(title_text="Portfolio return", tickformat=".0%", zeroline=True,
+                     zerolinecolor="#94A3B8")
+    fig.update_yaxes(title_text="Scenario", automargin=True)
+    return _polish_figure(
+        fig,
+        title="Portfolio returns under stress scenarios",
+        height=max(360, 48 * len(s) + 120),
+        hovermode="closest",
+        show_legend=False,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -350,13 +736,20 @@ def _fmt_pct(x: float) -> str:
 
 
 def render_overview(prices: pd.DataFrame, macro: pd.DataFrame | None, oos_start: str) -> None:
-    st.plotly_chart(fig_prices(prices, oos_start))
-    summary = pd.DataFrame({"first date": prices.index[0].date(), "last date": prices.index[-1].date(),
+    _display_chart(fig_prices(prices, oos_start))
+    summary = pd.DataFrame({"first date": prices.index[0].strftime("%b %d, %Y"),
+                            "last date": prices.index[-1].strftime("%b %d, %Y"),
                             "trading days": len(prices), "total return": prices.iloc[-1] / prices.iloc[0] - 1},
                            index=prices.columns)
-    st.dataframe(summary.assign(**{"total return": summary["total return"].map(_fmt_pct)}))
+    summary.index = summary.index.map(str)
+    _display_table(
+        summary,
+        index_name="Ticker",
+        percent_columns=("total return",),
+        integer_columns=("trading days",),
+    )
     if macro is not None and not macro.empty:
-        st.plotly_chart(fig_macro(macro))
+        _display_chart(fig_macro(macro))
     else:
         st.info("Macro data unavailable, so macro charts and factor stress tests are skipped.")
 
@@ -365,7 +758,29 @@ def render_pairs(pair_prices: pd.DataFrame, formation_end: str, oos_start: str) 
     st.markdown("**Pair selection uses only formation-period data**, so the out-of-sample result is not "
                 "contaminated by hindsight. The Bonferroni column corrects for testing many pairs.")
     screen = compute_screen(pair_prices, formation_end)
-    st.dataframe(screen.round(4))
+    screen = screen.copy()
+    screen.index = pd.RangeIndex(1, len(screen) + 1, name="Rank")
+    _display_table(
+        screen,
+        number_formats={
+            "adf_stat": "%.3f",
+            "pvalue": "%.4f",
+            "beta": "%.3f",
+            "alpha": "%.3f",
+            "half_life": "%.1f",
+            "pvalue_bonferroni": "%.4f",
+        },
+        column_labels={
+            "y": "Leg Y",
+            "x": "Hedge leg X",
+            "adf_stat": "ADF statistic",
+            "pvalue": "p-value",
+            "beta": "Hedge ratio",
+            "alpha": "Intercept",
+            "half_life": "Half-life (days)",
+            "pvalue_bonferroni": "Adjusted p-value",
+        },
+    )
     c1, c2, c3, c4 = st.columns(4)
     mode = c1.selectbox("Z-score mode", ["formation", "rolling"], index=0)
     entry = c2.slider("Entry |Z|", 1.0, 3.5, 2.0, 0.1)
@@ -389,11 +804,35 @@ def render_pairs(pair_prices: pd.DataFrame, formation_end: str, oos_start: str) 
                 f"{oos['sharpe_stderr']:.2f}. Short samples leave wide error bars.")
     m[2].metric("Max drawdown (OOS)", _fmt_pct(oos["max_drawdown"]))
     m[3].metric("Trades (OOS)", f"{oos['n_trades']:.0f}")
-    st.plotly_chart(fig_pairs(result, entry, exit_, oos_start))
+    _display_chart(fig_pairs(result, entry, exit_, oos_start))
     with st.expander("Full performance report"):
         st.text(result.report())
         st.text("Out-of-sample:\n" + result.report(oos))
-    st.dataframe(result.trades.tail(25))
+    trades = result.trades.tail(25)
+    if trades.empty:
+        st.info("No pair trades were generated for these settings and dates.")
+    else:
+        _display_table(
+            trades,
+            percent_columns=("gross_return", "net_return", "frictions"),
+            integer_columns=("trade_id", "holding_days"),
+            number_formats={"entry_z": "%.2f", "exit_z": "%.2f", "hedge_ratio": "%.3f"},
+            column_labels={
+                "trade_id": "Trade #",
+                "entry_signal_date": "Entry signal date",
+                "side": "Position side",
+                "entry_z": "Entry z-score",
+                "hedge_ratio": "Hedge ratio",
+                "exit_signal_date": "Exit signal date",
+                "exit_z": "Exit z-score",
+                "exit_reason": "Exit reason",
+                "holding_days": "Holding days",
+                "gross_return": "Gross return",
+                "net_return": "Net return",
+                "frictions": "Trading costs",
+            },
+            height=360,
+        )
 
 
 def render_optimizer(
@@ -401,16 +840,41 @@ def render_optimizer(
 ) -> OptimizationResult:
     result = compute_optimizer(prices, formation_end, rf, max_weight, estimator)
     st.text(result.summary())
-    st.plotly_chart(result.figure())
-    st.plotly_chart(fig_weights(result))
+    frontier_figure = result.figure()
+    frontier_figure.update_xaxes(title_text="Annualized volatility", tickformat=".1%")
+    frontier_figure.update_yaxes(title_text="Annualized return", tickformat=".1%")
+    if len(result.assets) > 16:
+        for trace in frontier_figure.data:
+            if trace.name == "Assets":
+                trace.mode = "markers"
+                trace.hovertemplate = (
+                    "%{text}<br>Volatility: %{x:.2%}<br>Return: %{y:.2%}<extra></extra>"
+                )
+    _display_chart(_polish_figure(frontier_figure, height=500))
+    _display_chart(fig_weights(result))
     st.markdown("**Weights chosen on the formation period, evaluated afterwards** "
                 "(the drop in Sharpe is estimation error, not bad luck):")
-    st.dataframe(in_vs_out_of_sample(result, prices, formation_end, oos_start, rf, max_weight, estimator).round(3))
+    comparison = in_vs_out_of_sample(
+        result, prices, formation_end, oos_start, rf, max_weight, estimator
+    )
+    _display_table(
+        comparison,
+        index_name="Portfolio",
+        percent_columns=("OOS return", "OOS volatility", "OOS max drawdown"),
+        number_formats={"Sharpe in-sample": "%.2f", "Sharpe out-of-sample": "%.2f"},
+    )
     lookback = st.slider("Walk-forward lookback (trading days)", 126, 504, 252, 21)
     wf = compute_walk_forward(prices, rf, max_weight, estimator, lookback)
     st.markdown(f"**Walk-forward re-optimization from {oos_start}** (monthly, 5 bps trading cost):")
-    st.dataframe(wf.metrics(start=oos_start).round(3))
-    st.plotly_chart(fig_walk_forward(wf, oos_start))
+    wf_metrics = wf.metrics(start=oos_start)
+    _display_table(
+        wf_metrics,
+        index_name="Portfolio",
+        percent_columns=("total_return", "ann_return", "ann_volatility", "max_drawdown",
+                         "avg_turnover"),
+        number_formats={"sharpe": "%.2f"},
+    )
+    _display_chart(fig_walk_forward(wf, oos_start))
     return result
 
 
@@ -440,41 +904,121 @@ def render_risk(
                 _fmt_pct(-hist["es"]))
     m[2].metric("Max drawdown", _fmt_pct(report.drawdown.max_drawdown))
     m[3].metric("Current drawdown", _fmt_pct(report.drawdown.current_drawdown))
-    st.dataframe(table.rename(columns={
-        "var_usd": f"VaR ({currency_code})",
-        "es_usd": f"Expected shortfall ({currency_code})",
-    }).round(4))
-    st.plotly_chart(fig_return_distribution(report, alpha))
-    st.plotly_chart(fig_drawdown(report))
-    st.dataframe(report.drawdown.episodes)
+    risk_table = table.reset_index()
+    _display_table(
+        risk_table,
+        percent_columns=("confidence", "var", "es"),
+        currency_columns=("var_usd", "es_usd"),
+        currency_symbol=currency_symbol,
+        number_formats={"confidence": "percent", "var": "percent", "es": "percent"},
+        column_labels={
+            "method": "Method",
+            "confidence": "Confidence level",
+            "var": "VaR return",
+            "es": "Expected shortfall return",
+            "var_usd": f"VaR ({currency_code})",
+            "es_usd": f"Expected shortfall ({currency_code})",
+        },
+    )
+    _display_chart(fig_return_distribution(report, alpha))
+    _display_chart(fig_drawdown(report))
+    _display_table(
+        report.drawdown.episodes,
+        percent_columns=("depth",),
+        integer_columns=("bars_to_trough", "bars_underwater"),
+        column_labels={
+            "peak_date": "Peak date",
+            "trough_date": "Trough date",
+            "recovery_date": "Recovery date",
+            "depth": "Drawdown depth",
+            "bars_to_trough": "Days to trough",
+            "bars_underwater": "Days underwater",
+            "recovered": "Recovered",
+        },
+    )
 
     st.subheader("Is the VaR model any good? (backtest)")
     st.caption("A forecast is made before each day using only past data. Kupiec tests the exception COUNT; "
                "Christoffersen tests whether exceptions CLUSTER. 'rejected' means the model is not trustworthy.")
-    st.dataframe(report.backtest.round(4))
+    backtest_table = report.backtest.reset_index()
+    _display_table(
+        backtest_table,
+        percent_columns=("rate",),
+        integer_columns=("days", "exceptions"),
+        number_formats={
+            "expected": "%.1f",
+            "kupiec_p": "%.3f",
+            "christoffersen_p": "%.3f",
+            "cond_coverage_p": "%.3f",
+        },
+        column_labels={
+            "method": "Method",
+            "confidence": "Confidence level",
+            "days": "Days",
+            "exceptions": "Exceptions",
+            "expected": "Expected exceptions",
+            "rate": "Exception rate",
+            "kupiec_p": "Kupiec p-value",
+            "christoffersen_p": "Christoffersen p-value",
+            "cond_coverage_p": "Conditional coverage p-value",
+            "verdict": "Model verdict",
+            "basel_zone_last250": "Basel zone (last 250)",
+        },
+    )
     method = st.selectbox("Show exceptions for", ["historical", "parametric", "ewma", "fhs"], index=3)
     engine = RiskEngine(report.config)
-    st.plotly_chart(fig_var_backtest(engine.backtest_var(report.returns, alpha, method),
-                                     f"{method} {alpha:.0%} VaR vs. realized returns"))
+    _display_chart(
+        fig_var_backtest(
+            engine.backtest_var(report.returns, alpha, method),
+            f"{method.upper()} {alpha:.0%} VaR vs. realized returns",
+        )
+    )
 
     st.subheader("Where does the risk come from?")
-    st.plotly_chart(fig_contributions(report))
+    _display_chart(fig_contributions(report))
     st.subheader("Stress scenarios")
     st.caption("Historical scenarios replay a past crisis on today's weights. Macro scenarios push hypothetical "
                "factor shocks through estimated sensitivities: they assume linear betas and ignore the "
                "correlation spike seen in real crises, so treat them as illustrations, not forecasts.")
-    st.plotly_chart(fig_stress(report))
-    st.dataframe(report.historical_stress.rename(columns={
-        "pnl_usd": f"P&L ({currency_code})"
-    }))
+    _display_chart(fig_stress(report))
+    _display_table(
+        report.historical_stress,
+        index_name="Scenario",
+        percent_columns=("portfolio_return", "worst_asset_return"),
+        integer_columns=("n_days",),
+        currency_columns=("pnl_usd",),
+        currency_symbol=currency_symbol,
+        column_labels={
+            "start": "Start date",
+            "end": "End date",
+            "n_days": "Trading days",
+            "portfolio_return": "Portfolio return",
+            "pnl_usd": f"P&L ({currency_code})",
+            "worst_asset": "Worst asset",
+            "worst_asset_return": "Worst asset return",
+        },
+    )
     if report.factor_stress is not None and not report.factor_stress.empty:
-        st.dataframe(report.factor_stress[["portfolio_return", "pnl_usd"]].rename(
-            columns={"pnl_usd": f"P&L ({currency_code})"}
-        ).round(4))
+        factor_stress = report.factor_stress[["portfolio_return", "pnl_usd"]]
+        _display_table(
+            factor_stress,
+            index_name="Scenario",
+            percent_columns=("portfolio_return",),
+            currency_columns=("pnl_usd",),
+            currency_symbol=currency_symbol,
+            column_labels={
+                "portfolio_return": "Portfolio return",
+                "pnl_usd": f"P&L ({currency_code})",
+            },
+        )
 
 
 def paper_trade_figure(
-    prices: pd.Series, symbol: str, fills: tuple[Fill, ...], currency_symbol: str = "$"
+    prices: pd.Series,
+    symbol: str,
+    fills: tuple[Fill, ...],
+    currency_symbol: str = "$",
+    currency_code: str = "USD",
 ) -> Any | None:
     """Plot close history and every simulated fill for one symbol."""
     history = pd.to_numeric(prices, errors="coerce").dropna().sort_index()
@@ -483,41 +1027,59 @@ def paper_trade_figure(
 
     figure = go.Figure()
     figure.add_trace(go.Scatter(
-        x=history.index, y=history.to_numpy(), mode="lines", name="Close",
-        line={"color": "#4C78A8", "width": 2},
+        x=history.index,
+        y=history.to_numpy(),
+        mode="lines",
+        name="Closing price",
+        line={"color": "#2563EB", "width": 2},
+        hovertemplate=(
+            f"%{{x|%b %d, %Y}}<br>Close: {currency_symbol}%{{y:,.2f}}<extra></extra>"
+        ),
     ))
     symbol_fills = [fill for fill in fills if fill.symbol == symbol]
     if symbol_fills:
-        colors = {"BUY": "#16803C", "COVER": "#2A9D8F", "SELL": "#E09F3E", "SHORT": "#C44536"}
-        markers = {"BUY": "triangle-up", "COVER": "circle", "SELL": "triangle-down", "SHORT": "triangle-down"}
-        figure.add_trace(go.Scatter(
-            x=[fill.timestamp for fill in symbol_fills],
-            y=[fill.fill_price for fill in symbol_fills],
-            mode="markers",
-            name="Paper trades",
-            marker={
-                "size": 12,
-                "color": [colors[fill.action.value] for fill in symbol_fills],
-                "symbol": [markers[fill.action.value] for fill in symbol_fills],
-                "line": {"color": "white", "width": 1},
-            },
-            text=[f"{fill.action.value} {fill.quantity:g} shares" for fill in symbol_fills],
-            customdata=[[fill.reference_price, fill.commission] for fill in symbol_fills],
-            hovertemplate=(
-                f"%{{text}}<br>%{{x}}<br>Fill: {currency_symbol}%{{y:.2f}}"
-                f"<br>Reference: {currency_symbol}%{{customdata[0]:.2f}}"
-                f"<br>Commission: {currency_symbol}%{{customdata[1]:.2f}}<extra></extra>"
-            ),
-        ))
-    figure.update_layout(
-        title=f"{symbol} close price and paper trades",
-        xaxis_title="Date",
-        yaxis_title=f"Price ({currency_symbol})",
-        template=TEMPLATE,
-        hovermode="closest",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
+        colors = {"BUY": "#0F766E", "COVER": "#0891B2", "SELL": "#D97706", "SHORT": "#DC2626"}
+        markers = {
+            "BUY": "triangle-up",
+            "COVER": "circle",
+            "SELL": "triangle-down",
+            "SHORT": "triangle-down",
+        }
+        for action in ("BUY", "SELL", "SHORT", "COVER"):
+            action_fills = [fill for fill in symbol_fills if fill.action.value == action]
+            if not action_fills:
+                continue
+            figure.add_trace(go.Scatter(
+                x=[fill.timestamp for fill in action_fills],
+                y=[fill.fill_price for fill in action_fills],
+                mode="markers",
+                name=action.title(),
+                marker={
+                    "size": 11,
+                    "color": colors[action],
+                    "symbol": markers[action],
+                    "line": {"color": "#FFFFFF", "width": 1.2},
+                },
+                text=[f"{fill.action.value} {fill.quantity:g} shares" for fill in action_fills],
+                customdata=[[fill.reference_price, fill.commission] for fill in action_fills],
+                hovertemplate=(
+                    f"%{{text}}<br>%{{x|%b %d, %Y}}<br>Fill: {currency_symbol}%{{y:,.2f}}"
+                    f"<br>Reference: {currency_symbol}%{{customdata[0]:,.2f}}"
+                    f"<br>Commission: {currency_symbol}%{{customdata[1]:,.2f}}<extra></extra>"
+                ),
+            ))
+    figure.update_xaxes(title_text="Date")
+    figure.update_yaxes(
+        title_text=f"Price ({currency_code})",
+        tickprefix=currency_symbol,
+        tickformat=",.2f",
     )
-    return figure
+    return _polish_figure(
+        figure,
+        title=f"{symbol} · price and paper trades",
+        height=430,
+        hovermode="closest",
+    )
 
 
 def render_paper_trading(
@@ -722,14 +1284,21 @@ def render_paper_trading(
 
     if account.positions:
         st.markdown("**Open paper positions**")
-        st.dataframe(pd.DataFrame([{
+        positions = pd.DataFrame([{
             "Symbol": p.symbol, "Shares": p.quantity,
             f"Average entry ({currency_code})": p.average_entry_price,
             f"Latest mark ({currency_code})": p.market_price,
             f"Market value ({currency_code})": p.market_value,
             f"Unrealized P&L ({currency_code})": p.unrealized_pnl,
             f"Realized P&L ({currency_code})": p.realized_pnl,
-        } for p in account.positions]).set_index("Symbol"))
+        } for p in account.positions]).set_index("Symbol")
+        _display_table(
+            positions,
+            index_name="Symbol",
+            currency_columns=tuple(positions.columns[1:]),
+            currency_symbol=currency_symbol,
+            number_formats={"Shares": "%,.3f"},
+        )
     if account.fills:
         traded_symbols = sorted({fill.symbol for fill in account.fills})
         st.markdown("**Stock price charts with paper trades**")
@@ -739,19 +1308,32 @@ def render_paper_trading(
                 st.info(f"No retained price history is available for {traded_symbol}.")
                 continue
             trade_chart = paper_trade_figure(
-                history[traded_symbol], traded_symbol, account.fills, currency_symbol
+                history[traded_symbol],
+                traded_symbol,
+                account.fills,
+                currency_symbol,
+                currency_code,
             )
             if trade_chart is not None:
-                st.plotly_chart(trade_chart, use_container_width=True)
+                _display_chart(trade_chart)
             else:
-                st.line_chart(history[traded_symbol], use_container_width=True)
+                st.line_chart(
+                    history[traded_symbol], **_wide_widget_kwargs(st.line_chart)
+                )
 
         st.markdown("**Order audit log**")
-        st.dataframe(pd.DataFrame([{
+        audit_log = pd.DataFrame([{
             "Time": f.timestamp, "Symbol": f.symbol, "Action": f.action.value,
             "Shares": f.quantity, "Reference close": f.reference_price,
             "Fill price": f.fill_price, "Commission": f.commission,
-        } for f in account.fills]).set_index("Time").sort_index(ascending=False))
+        } for f in account.fills]).sort_values("Time", ascending=False)
+        _display_table(
+            audit_log,
+            currency_columns=("Reference close", "Fill price", "Commission"),
+            currency_symbol=currency_symbol,
+            number_formats={"Shares": "%,.3f"},
+            height=360,
+        )
     if st.button("Reset paper account", key=f"{key_prefix}_reset_account"):
         del st.session_state[state_key]
         st.rerun()
