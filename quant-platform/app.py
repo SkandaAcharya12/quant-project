@@ -1360,7 +1360,6 @@ def paper_signal_figure(
         shared_xaxes=True,
         vertical_spacing=0.045,
         row_heights=(0.62, 0.22, 0.16),
-        subplot_titles=("Adjusted OHLC", "Model momentum and trend inputs", "Model volatility input"),
     )
     figure.add_trace(
         go.Candlestick(
@@ -1518,8 +1517,6 @@ def paper_signal_figure(
             line_dash="dash",
             line_color="#475569",
             line_width=1.2,
-            annotation_text="Model cutoff" if row == 1 else None,
-            annotation_position="top left" if row == 1 else None,
             row=row,
             col=1,
         )
@@ -1531,7 +1528,13 @@ def paper_signal_figure(
     figure.update_xaxes(title_text="Date", row=3, col=1)
     figure.update_layout(xaxis_rangeslider_visible=False)
     title = f"{symbol} · AI signal and model inputs"
-    return _polish_figure(figure, title=title, height=690, hovermode="x unified")
+    return _polish_figure(
+        figure,
+        title=title,
+        height=690,
+        hovermode="closest",
+        show_legend=False,
+    )
 
 
 def render_paper_trading(
@@ -1739,10 +1742,10 @@ def render_paper_trading(
                 height=250,
             )
         st.caption(
-            "Candles and moving averages provide price context. The lower panels show the "
-            "model's exact trailing momentum, moving-average spread, and realized-volatility "
-            "inputs through the dashed cutoff. The next available candle is shown as the fill "
-            "reference and is excluded from the model features."
+            "Candles and moving averages provide price context. The lower panels plot the "
+            "model's trailing momentum, moving-average spread, and realized volatility through "
+            "the dashed cutoff. Hover a line or marker for its name and value. The next candle "
+            "is only a paper-fill reference and is excluded from the model features."
         )
         signal_chart = paper_signal_figure(
             ohlcv_history,
