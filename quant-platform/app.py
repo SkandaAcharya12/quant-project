@@ -19,7 +19,8 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import logging
-from collections.abc import Callable, Iterable
+import os
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
 
 import numpy as np
@@ -61,6 +62,12 @@ from paper_trading import (
     PaperSimulator,
     ResearchAgent,
     TradeAction,
+)
+from research_assistant import (
+    AssistantConfig,
+    AssistantError,
+    AssistantMessage,
+    MarketResearchAssistant,
 )
 from risk_engine import (
     RiskConfig,
@@ -1967,6 +1974,156 @@ def render_trading_tutorial() -> None:
             st.info("Try again: the high and low are extremes, while the open is the first price.")
 
 
+def _research_assistant_config() -> AssistantConfig | None:
+    """Read optional credentials from server environment or Streamlit Secrets."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    model = os.environ.get("OPENAI_MODEL", "").strip()
+    secret_values: Mapping[str, object] = {}
+    try:
+        configured_secrets = st.secrets if st is not None else {}
+        if isinstance(configured_secrets, Mapping):
+            secret_values = configured_secrets
+    except Exception as exc:  # noqa: BLE001 - absent Streamlit Secrets is a supported setup state
+        logger.debug("Streamlit Secrets are unavailable for the AI assistant: %s", type(exc).__name__)
+    if not api_key:
+        value = secret_values.get("OPENAI_API_KEY")
+        api_key = value.strip() if isinstance(value, str) else ""
+    if not model:
+        value = secret_values.get("OPENAI_MODEL")
+        model = value.strip() if isinstance(value, str) else ""
+    if not api_key:
+        return None
+    return AssistantConfig(api_key=api_key, model=model or "gpt-6-astra")
+
+
+def _build_assistant_market_context(
+    market: MarketSection,
+    tickers: tuple[str, ...],
+    prices: pd.DataFrame,
+) -> str:
+    """Create a small, dated market snapshot without sending paper-account balances."""
+    clean_prices = prices.apply(pd.to_numeric, errors="coerce")
+    clean_prices = clean_prices.replace([np.inf, -np.inf], np.nan).dropna(how="all").sort_index()
+    lines = [
+        f"Market: {market.name}.",
+        f"Quote currency: {market.currency_code}; no FX conversion is applied.",
+        "The figures below are historical dashboard data, not live quotes or trade advice.",
+    ]
+    if clean_prices.empty:
+        return "\n".join(lines + ["No usable price snapshot is currently loaded."])
+
+    available_columns = {str(column).upper(): column for column in clean_prices.columns}
+    selected = tuple(dict.fromkeys(str(ticker).strip().upper() for ticker in tickers))[:15]
+    lines.append("Selected tickers: " + (", ".join(selected) if selected else "none") + ".")
+    included = 0
+    for symbol in selected:
+        column = available_columns.get(symbol)
+        if column is None:
+            continue
+        series = clean_prices[column].dropna()
+        if series.empty:
+            continue
+        latest_date = pd.Timestamp(series.index[-1]).date().isoformat()
+        last_close = float(series.iloc[-1])
+        record = (
+            f"{symbol}: close {market.currency_symbol}{last_close:,.2f} "
+            f"({market.currency_code}) as of {latest_date}"
+        )
+        if len(series) > 21:
+            return_21 = float(series.iloc[-1] / series.iloc[-22] - 1.0)
+            record += f"; 21-session price return {return_21:+.1%}"
+        lines.append(record + ".")
+        included += 1
+    if included == 0:
+        lines.append("No selected ticker has a usable close in the loaded snapshot.")
+    if len(selected) < len(set(tickers)):
+        lines.append("Only the first 15 selected ticker symbols are included in this context.")
+    return "\n".join(lines)
+
+
+def render_research_chat(market_key: str, market_context: str) -> None:
+    """Render a session-scoped, OpenAI-backed Q&A popover."""
+    with st.popover(
+        "💬 Ask the agent",
+        help="Ask about trading terms, this platform, or the selected market snapshot.",
+    ):
+        st.markdown(
+            "I can explain this site's charts, portfolio tools, risk estimates, and paper-trading "
+            "actions in beginner-friendly language."
+        )
+        config = _research_assistant_config()
+        if config is None:
+            st.info("AI chat is not configured for this deployment yet.")
+            st.caption(
+                "Add OPENAI_API_KEY in Streamlit Secrets to enable it. You can optionally set "
+                "OPENAI_MODEL. Never put an API key in GitHub."
+            )
+            return
+
+        st.caption(
+            "Messages and a small selected-market snapshot are sent to OpenAI when you ask. "
+            "Do not share personal information. API use may incur charges; answers can be wrong."
+        )
+        state_key = f"research_chat_{market_key}"
+        raw_history = st.session_state.get(state_key, [])
+        history: list[AssistantMessage] = []
+        if isinstance(raw_history, list):
+            for item in raw_history:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                content = item.get("content")
+                if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                    history.append(AssistantMessage(role=role, content=content[:1_200]))
+
+        if history and st.button("Clear conversation", key=f"{state_key}_clear"):
+            st.session_state[state_key] = []
+            st.rerun()
+        for message in history[-12:]:
+            with st.chat_message(message.role):
+                st.markdown(message.content)
+
+        with st.form(f"{state_key}_form", clear_on_submit=True):
+            question = st.text_input(
+                "Your question",
+                placeholder="For example: What does VaR mean?",
+                max_chars=1_200,
+                key=f"{state_key}_input",
+            )
+            submitted = st.form_submit_button("Send")
+        if not submitted:
+            return
+        prompt = str(question).strip()
+        if not prompt:
+            st.info("Type a question first.")
+            return
+
+        user_message = AssistantMessage(role="user", content=prompt[:1_200])
+        stored_history = [
+            {"role": message.role, "content": message.content}
+            for message in history[-23:]
+        ]
+        stored_history.append({"role": user_message.role, "content": user_message.content})
+        st.session_state[state_key] = stored_history
+        with st.chat_message("user"):
+            st.markdown(user_message.content)
+        assistant = MarketResearchAssistant(config)
+        try:
+            with st.spinner("The agent is thinking..."):
+                answer = assistant.answer([*history[-11:], user_message], market_context)
+        except AssistantError as exc:
+            st.error(str(exc))
+            return
+
+        assistant_message = AssistantMessage(role="assistant", content=answer)
+        stored_history.append(
+            {"role": assistant_message.role, "content": assistant_message.content}
+        )
+        st.session_state[state_key] = stored_history[-24:]
+        with st.chat_message("assistant"):
+            st.markdown(assistant_message.content)
+
+
 def main() -> None:
     if st is None:  # pragma: no cover
         raise RuntimeError("streamlit is not installed: pip install -r requirements.txt")
@@ -2129,6 +2286,19 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Macro data unavailable ({exc}). Factor stress tests will be skipped.")
         macro = None
+
+    assistant_prices = pd.concat([prices, pair_prices], axis=1)
+    assistant_prices = assistant_prices.loc[:, ~assistant_prices.columns.duplicated()]
+    assistant_context = _build_assistant_market_context(
+        market,
+        tuple(portfolio_tickers) + tuple(pairs_tickers),
+        assistant_prices,
+    )
+    assistant_columns = st.columns([0.82, 0.18])
+    with assistant_columns[0]:
+        st.caption("Questions about the tools or selected market data? Ask the agent.")
+    with assistant_columns[1]:
+        render_research_chat(market.key, assistant_context)
 
     tabs = st.tabs(["Market data", "Pairs trading", "Portfolio optimizer", "Risk & stress",
                     "Paper trading"])
