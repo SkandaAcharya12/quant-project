@@ -1865,18 +1865,126 @@ def _load_paper_prices(
     )
 
 
+_TRADING_101_LESSONS: dict[str, str] = {
+    "1 · Start with the basics": """### Shares, tickers, and returns
+
+A **share** is a unit of ownership in a company. A **ticker** is its short market symbol.
+For example, this site lets you search by company name or ticker in the market selector.
+
+**Simple price return** = (ending price − starting price) ÷ starting price. If a share moves
+from $100 to $105, its price return is 5% before fees. A return can also be negative, and
+past price moves do not predict future returns.
+
+Learn more: [Investor.gov stock basics](https://www.investor.gov/introduction-investing/investing-basics/investment-products/stocks).""",
+    "2 · Read a candlestick": """### What one candle shows
+
+Each candle summarizes a time interval using four prices: **open**, **high**, **low**, and
+**close**. A candle body compares the open with the close; its thin lines show the high and
+low reached during that interval. This chart uses daily bars. Candle colors are a visual
+convention and can differ between charting tools.
+
+In the paper-trading chart, the dashed line marks when the model made its decision. The next
+available close is shown as a fill reference, and is excluded from the model inputs.""",
+    "3 · Understand trade actions": """### Long and short positions
+
+- **Buy** opens or adds to a long position: you benefit if the price rises.
+- **Sell** reduces or closes a long position.
+- **Short** opens or adds to a short position: you benefit if the price falls.
+- **Cover** reduces or closes a short position.
+
+Short selling can lose money as the price rises. This simulator is simplified: it applies
+commission and slippage, but does not model real stock borrowing, margin calls, or a live
+order book. It fills your paper order using the displayed close. Real market orders can fill
+at a different price, while a limit order may not fill at all. Read [FINRA's overview of
+order types](https://syndication.finra.org/content/understanding-order-types-can-save-time-and-money)
+and the [SEC's short-sale overview](https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins/investor-bulletins-51).""",
+    "4 · Learn the risk tools": """### Risk is part of every trade
+
+**Diversification** spreads exposure across investments, but cannot remove all risk.
+**Volatility** describes how much returns have varied; it does not say which way a price will
+move next. The portfolio optimizer's maximum weight limits concentration in one stock.
+
+**Value at Risk (VaR)** estimates a loss threshold over a chosen time horizon and confidence
+level. It is not a maximum-loss estimate: losses can exceed VaR. Stress tests show how a
+portfolio would respond to selected historical or hypothetical shocks.
+
+Learn more: [Investor.gov on diversification](https://www.investor.gov/introduction-investing/getting-started/asset-allocation).""",
+    "5 · Read the AI research alert": """### What the alert means
+
+The research agent estimates the probability of a positive or negative next-session return
+from five trailing inputs: 5-, 21-, and 63-session momentum; 21-session realized volatility;
+and the 20/60-session moving-average spread. The chart and table show those inputs at the
+decision close.
+
+Actionable alerts require the model's stronger direction to reach its 90% probability
+threshold; otherwise the suggestion is **HOLD**. That percentage is a model estimate, not a
+90% proven win rate or a promise. The agent only suggests actions and never places orders.""",
+    "6 · Follow a practice routine": """### A guided tour of this site
+
+1. Choose a **market** and search for stocks by company name or ticker in the sidebar.
+2. Start in **Market data** to review prices and indicators.
+3. Use **Pairs trading** to study whether two stocks have moved together historically.
+4. Use **Portfolio optimizer** to explore sample-based portfolio weights.
+5. Review **Risk & stress** to inspect loss estimates and scenario results.
+6. Open **Paper trading**, choose the stocks for that market's separate practice account,
+   and start with an amount you can track comfortably.
+7. Before placing an order, write down why you chose it. Afterwards, review the fill, costs,
+   position size, and result. Treat the AI alert as one research input, not an instruction.
+
+All market data and model outputs can be incomplete or wrong. This site is for education and
+simulation; it does not connect to a broker or provide personalized financial advice.""",
+}
+
+
+def render_trading_tutorial() -> None:
+    """Render a concise, interactive trading guide before the market tools."""
+    with st.expander("Trading 101 · Beginner tutorial", expanded=False):
+        st.markdown(
+            "A short, practical guide to the charts, risk measures, and paper account below. "
+            "Choose a lesson, then try the practice simulator when you are ready."
+        )
+        lesson = st.selectbox(
+            "Choose a lesson",
+            tuple(_TRADING_101_LESSONS),
+            key="trading_101_lesson",
+        )
+        st.markdown(_TRADING_101_LESSONS[lesson])
+        st.divider()
+        answer = st.selectbox(
+            "Quick check: which candle value is the last price in that interval?",
+            (
+                "Choose an answer",
+                "Close",
+                "Open",
+                "High",
+                "Low",
+            ),
+            key="trading_101_candle_quiz",
+        )
+        if answer == "Close":
+            st.success("Correct. The close is the interval's final recorded price.")
+        elif answer != "Choose an answer":
+            st.info("Try again: the high and low are extremes, while the open is the first price.")
+
+
 def main() -> None:
     if st is None:  # pragma: no cover
         raise RuntimeError("streamlit is not installed: pip install -r requirements.txt")
     st.set_page_config(page_title="Quant Platform", layout="wide")
     st.title("Algorithmic Trading & Portfolio Optimization Platform")
-    st.caption("Estimated on a formation period, judged out-of-sample. Educational research tool, not investment advice.")
+    st.caption(
+        "Explore market data, compare research methods, measure risk, and practice with a "
+        "simulated account. Educational use only; results are estimates, not investment advice."
+    )
+    render_trading_tutorial()
 
     with st.sidebar:
         st.header("Settings")
+        st.caption("Choose a market and stock universe here. Each market has its own paper account.")
         market: MarketSection = st.selectbox(
             "Market section", MARKET_SECTIONS, format_func=lambda item: item.name,
             key="market_section",
+            help="Select a region to change the ticker list, local quote currency, and paper account.",
         )
 
     try:
@@ -1936,19 +2044,61 @@ def main() -> None:
         pairs_tickers = _stored_tickers(pairs_selection)
         if pairs_tickers is None:
             pairs_tickers = pairs_default
-        start = st.date_input("History starts", dt.date(2018, 1, 1))
-        formation_end = st.date_input("Formation period ends", dt.date(2024, 12, 31))
-        oos_start = st.date_input("Out-of-sample starts", dt.date(2025, 1, 1))
-        rf = st.number_input("Risk-free rate (annual)", 0.0, 0.15, 0.03, 0.005, format="%.3f")
-        max_weight = st.slider("Max weight per asset", 0.15, 1.0, 0.40, 0.05)
-        estimator = st.selectbox("Expected-return estimator", ["bayes_stein", "historical"], index=0)
+        start = st.date_input(
+            "History starts",
+            dt.date(2018, 1, 1),
+            help="First date used to load prices. Longer histories may take longer to download.",
+        )
+        formation_end = st.date_input(
+            "Formation period ends",
+            dt.date(2024, 12, 31),
+            help="End of the historical sample used to estimate strategy and portfolio inputs.",
+        )
+        oos_start = st.date_input(
+            "Out-of-sample starts",
+            dt.date(2025, 1, 1),
+            help="Start of the held-out period used to review results after estimation.",
+        )
+        rf = st.number_input(
+            "Risk-free rate (annual)",
+            0.0,
+            0.15,
+            0.03,
+            0.005,
+            format="%.3f",
+            help="Annual comparison rate used in risk-adjusted portfolio calculations.",
+        )
+        max_weight = st.slider(
+            "Max weight per asset",
+            0.15,
+            1.0,
+            0.40,
+            0.05,
+            help="Upper limit on how much of the optimized portfolio can go to one stock.",
+        )
+        estimator = st.selectbox(
+            "Expected-return estimator",
+            ["bayes_stein", "historical"],
+            index=0,
+            help="Choose how expected returns are estimated from the formation period.",
+        )
         value = st.number_input(
             f"Portfolio value ({market.currency_code})", 10_000.0, 1e9, 1_000_000.0,
             50_000.0, key=f"portfolio_value_{market.key}",
+            help="Practice account value used to scale portfolio risk estimates.",
         )
-        horizon = st.selectbox("VaR horizon (days)", [1, 5, 10], index=0)
-        confidences = tuple(sorted(st.multiselect("Confidence levels", [0.90, 0.95, 0.975, 0.99],
-                                                  default=[0.95, 0.99]))) or (0.95, 0.99)
+        horizon = st.selectbox(
+            "VaR horizon (days)",
+            [1, 5, 10],
+            index=0,
+            help="Number of trading days in each loss estimate.",
+        )
+        confidences = tuple(sorted(st.multiselect(
+            "Confidence levels",
+            [0.90, 0.95, 0.975, 0.99],
+            default=[0.95, 0.99],
+            help="Higher confidence levels show more severe loss thresholds; losses can exceed VaR.",
+        ))) or (0.95, 0.99)
 
     if not start < formation_end < oos_start:
         st.error("Dates must satisfy: history start < formation end < out-of-sample start.")
