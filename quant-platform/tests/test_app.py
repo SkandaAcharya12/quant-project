@@ -82,6 +82,14 @@ class FakeStreamlit(types.ModuleType):
     def expander(self, *_a: object, **_k: object) -> _Ctx:
         return _Ctx()
 
+    def popover(self, *_a: object, **_k: object) -> _Ctx:
+        self.calls.append("popover")
+        return _Ctx()
+
+    def chat_message(self, *_a: object, **_k: object) -> _Ctx:
+        self.calls.append("chat_message")
+        return _Ctx()
+
     def form(self, *_a: object, **_k: object) -> _Ctx:
         return _Ctx()
 
@@ -329,6 +337,7 @@ class UiWiringTests(unittest.TestCase):
         self.assertIn("title", st.calls)
         self.assertIn("Paper trading", st.tab_labels)
         self.assertIn("widget:Choose a lesson", st.calls)
+        self.assertIn("popover", st.calls)
 
     def test_beginner_tutorial_renders_each_lesson_and_quiz_feedback(self) -> None:
         for lesson in (
@@ -349,6 +358,45 @@ class UiWiringTests(unittest.TestCase):
             self.assertIn("widget:Choose a lesson", st.calls)
             self.assertIn("widget:Quick check: which candle value is the last price in that interval?", st.calls)
             self.assertIn("success", st.calls)
+
+    def test_chat_popover_sends_question_and_keeps_response_in_session(self) -> None:
+        st = FakeStreamlit({"Your question": "Explain the latest return", "Send": True})
+        with mock.patch.dict(sys.modules, fake_modules(st)), mock.patch.dict(
+            "os.environ", {"OPENAI_API_KEY": "test-key"}
+        ):
+            app = import_app(st)
+            with mock.patch.object(
+                app.MarketResearchAssistant,
+                "answer",
+                return_value="A return compares prices over time.",
+            ) as answer:
+                app.render_research_chat("us", "Market: United States; date: 2026-11-10.")
+
+        answer.assert_called_once()
+        self.assertEqual(
+            st.session_state["research_chat_us"][-1]["content"],
+            "A return compares prices over time.",
+        )
+        self.assertEqual(st.calls.count("chat_message"), 2)
+
+    def test_assistant_context_is_dated_and_does_not_include_account_balances(self) -> None:
+        st = FakeStreamlit()
+        with mock.patch.dict(sys.modules, fake_modules(st)):
+            app = import_app(st)
+        prices = pd.DataFrame(
+            {"TEST": np.linspace(100.0, 110.0, 23)},
+            index=pd.bdate_range("2026-10-01", periods=23),
+        )
+
+        context = app._build_assistant_market_context(
+            app.MARKET_SECTIONS[0], ("TEST",), prices
+        )
+
+        self.assertIn("Market: United States", context)
+        self.assertIn("Quote currency: USD", context)
+        self.assertIn("TEST: close $110.00", context)
+        self.assertIn("21-session price return", context)
+        self.assertNotIn("cash", context.lower())
 
     def test_cvar_lab_renders_when_enabled(self) -> None:
         st = self._run({"Run CVaR research lab": True})
