@@ -328,6 +328,27 @@ class UiWiringTests(unittest.TestCase):
         self.assertEqual(st.calls.count("dataframe"), 9)
         self.assertIn("title", st.calls)
         self.assertIn("Paper trading", st.tab_labels)
+        self.assertIn("widget:Choose a lesson", st.calls)
+
+    def test_beginner_tutorial_renders_each_lesson_and_quiz_feedback(self) -> None:
+        for lesson in (
+            "1 · Start with the basics",
+            "2 · Read a candlestick",
+            "3 · Understand trade actions",
+            "4 · Learn the risk tools",
+            "5 · Read the AI research alert",
+            "6 · Follow a practice routine",
+        ):
+            st = FakeStreamlit({
+                "Choose a lesson": lesson,
+                "Quick check: which candle value is the last price in that interval?": "Close",
+            })
+            with mock.patch.dict(sys.modules, fake_modules(st)):
+                app = import_app(st)
+                app.render_trading_tutorial()
+            self.assertIn("widget:Choose a lesson", st.calls)
+            self.assertIn("widget:Quick check: which candle value is the last price in that interval?", st.calls)
+            self.assertIn("success", st.calls)
 
     def test_cvar_lab_renders_when_enabled(self) -> None:
         st = self._run({"Run CVaR research lab": True})
